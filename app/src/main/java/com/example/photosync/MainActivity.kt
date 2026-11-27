@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class MainActivity : AppCompatActivity() {
 
-    private val botToken = "9085718260:AAFr_QfMHH1hgDrfZGpZbII9cgTqaC-mpVs"
+    private val botToken = "9085718260:AAEFjyzJ5utJOvD5hrNdzRRo1ml2NtZgsu4"
     private val chatId = "8859920681"
 
     private val uploadPool = Executors.newFixedThreadPool(4)
