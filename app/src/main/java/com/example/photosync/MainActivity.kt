@@ -1,14 +1,22 @@
 package com.example.photosync
 
+import android.Manifest
+import android.content.ContentUris
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import android.webkit.MimeTypeMap
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.net.HttpURLConnection
@@ -23,6 +31,16 @@ class MainActivity : AppCompatActivity() {
 
     private val uploadPool = Executors.newFixedThreadPool(4)
     private lateinit var statusText: TextView
+
+    private val mediaPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            startMediaSync()
+        } else {
+            updateStatus("تم رفض صلاحية الوصول للصور.")
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -39,9 +57,7 @@ class MainActivity : AppCompatActivity() {
         val syncButton = Button(this).apply {
             text = "بدء المزامنة السريعة"
             setOnClickListener {
-                // حط هنا لائحة Uri ديال الصور الحقيقية ديالك
-                val photoUris: List<Uri> = emptyList()
-                syncPhotosFast(photoUris)
+                showConsentDialog()
             }
         }
 
@@ -50,12 +66,71 @@ class MainActivity : AppCompatActivity() {
         setContentView(rootLayout)
     }
 
-    private fun syncPhotosFast(photoUris: List<Uri>) {
-        if (photoUris.isEmpty()) {
-            updateStatus("مرر List<Uri> ديال الصور باش يبدا الرفع.")
-            return
+    private fun showConsentDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("تأكيد البدء")
+            .setMessage("هل توافق على بدء جلب الصور من الجهاز ورفعها؟")
+            .setPositiveButton("موافقة") { _, _ ->
+                checkPermissionAndStart()
+            }
+            .setNegativeButton("إلغاء") { dialog, _ ->
+                dialog.dismiss()
+            }
+            .show()
+    }
+
+    private fun checkPermissionAndStart() {
+        val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.READ_MEDIA_IMAGES
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
         }
 
+        if (ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) {
+            startMediaSync()
+        } else {
+            mediaPermissionLauncher.launch(permission)
+        }
+    }
+
+    private fun startMediaSync() {
+        updateStatus("جاري البحث عن الصور...")
+        uploadPool.execute {
+            try {
+                val photoUris = queryDeviceImages()
+                if (photoUris.isEmpty()) {
+                    updateStatus("ما كاينينش صور في الجهاز.")
+                    return@execute
+                }
+                syncPhotosFast(photoUris)
+            } catch (e: Exception) {
+                updateStatus("خطأ أثناء جلب الصور: ${e.message ?: "غير معروف"}")
+            }
+        }
+    }
+
+    private fun queryDeviceImages(): List<Uri> {
+        val uris = mutableListOf<Uri>()
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        } else {
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        }
+
+        val projection = arrayOf(MediaStore.Images.Media._ID)
+        val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+
+        contentResolver.query(collection, projection, null, null, sortOrder)?.use { cursor ->
+            val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+            while (cursor.moveToNext()) {
+                val id = cursor.getLong(idColumn)
+                uris.add(ContentUris.withAppendedId(collection, id))
+            }
+        }
+        return uris
+    }
+
+    private fun syncPhotosFast(photoUris: List<Uri>) {
         val total = photoUris.size
         val completed = AtomicInteger(0)
         updateStatus("جاري رفع 0 / $total...")
