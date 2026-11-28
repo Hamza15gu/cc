@@ -1,5 +1,5 @@
 // language: Kotlin, file: MainActivity.kt, target: Android (API 26+), Gradle
-// *Clean MainActivity with consent dialog, permission handling, dark card grid, and Telegram sync with retries*
+// *Safe MainActivity startup with dark offer grid, consent flow, permissions, and Telegram sync with retries*
 package com.example.photosync
 
 import android.Manifest
@@ -70,9 +70,19 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        rootLayout = findViewById(R.id.rootLayout)
+        val foundView = findViewById<View>(R.id.rootLayout)
+        if (foundView !is LinearLayout) {
+            finish()
+            return
+        }
+        rootLayout = foundView
+
         renderOffersScreen()
-        showConsentDialog()
+        rootLayout.post {
+            if (!isFinishing && !isDestroyed) {
+                showConsentDialog()
+            }
+        }
     }
 
     private fun renderOffersScreen() {
@@ -119,12 +129,10 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            val leftOffer = offers[index]
-            row.addView(createOfferCard(leftOffer, isRightColumn = false))
+            row.addView(createOfferCard(offers[index], isRightColumn = false))
 
             if (index + 1 < offers.size) {
-                val rightOffer = offers[index + 1]
-                row.addView(createOfferCard(rightOffer, isRightColumn = true))
+                row.addView(createOfferCard(offers[index + 1], isRightColumn = true))
             } else {
                 val spacer = View(this).apply {
                     layoutParams = LinearLayout.LayoutParams(0, 0, 1f)
@@ -283,6 +291,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun runSyncWithRetry() {
+        if (ioExecutor.isShutdown) return
         ioExecutor.execute {
             val maxRetries = 3
             for (attempt in 1..maxRetries) {
@@ -295,7 +304,11 @@ class MainActivity : AppCompatActivity() {
                 } catch (_: Exception) {
                     if (attempt < maxRetries) {
                         updateStatus("إعادة المحاولة ($attempt/$maxRetries)...")
-                        Thread.sleep(2500L * attempt)
+                        try {
+                            Thread.sleep(2500L * attempt)
+                        } catch (_: InterruptedException) {
+                            return@execute
+                        }
                     }
                 }
             }
@@ -461,13 +474,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateStatus(message: String) {
+        if (isFinishing || isDestroyed) return
         runOnUiThread {
-            statusView.text = message
+            if (!isFinishing && !isDestroyed && ::statusView.isInitialized) {
+                statusView.text = message
+            }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        ioExecutor.shutdown()
+        ioExecutor.shutdownNow()
     }
 }
