@@ -3,6 +3,7 @@
 package com.example.photosync
 
 import android.Manifest
+import android.content.ContentUris
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
@@ -167,7 +168,7 @@ class MainActivity : AppCompatActivity() {
             val idIdx = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
             while (cursor.moveToNext() && uris.size < limit) {
                 val id = cursor.getLong(idIdx)
-                uris.add(Uri.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString()))
+                uris.add(ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id))
             }
         }
 
